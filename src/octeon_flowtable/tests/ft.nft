@@ -1,0 +1,16 @@
+flush ruleset
+table inet ft {
+	flowtable f {
+		hook ingress priority 0
+		devices = { eth1, eth2 }
+		flags offload
+	}
+	chain forward {
+		type filter hook forward priority 0
+		ip protocol { tcp, udp } flow add @f
+	}
+	chain post {
+		type nat hook postrouting priority 100
+		oifname "eth2" masquerade
+	}
+}

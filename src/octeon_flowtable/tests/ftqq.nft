@@ -1,0 +1,11 @@
+table inet ftqq {
+	flowtable f {
+		hook ingress priority filter
+		devices = { eth2.50.60, eth1 }
+		flags offload
+	}
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		ip protocol { tcp, udp } flow add @f
+	}
+}

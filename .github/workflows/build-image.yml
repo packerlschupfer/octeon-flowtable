@@ -1,0 +1,177 @@
+name: build-image
+
+# Builds flashable OpenWrt images for the EdgeRouter Lite (Octeon+ CN5020) with the
+# clean-room hardware flow offload baked into the kernel. Two variants are built in
+# parallel:
+#   * lean   — offload + conntrack/tcpdump (clean base; add your own packages)
+#   * router — lean + LuCI web UI + WireGuard (more turnkey home router)
+#
+# WHY a full image (not just the kmod): the staging octeon_ethernet driver is built
+# into vmlinux and octeon_flowtable.ko links against symbols only the *patched* kernel
+# exports. A stock-kernel image + sideloaded .ipk/.apk cannot work — the patch lives
+# in the kernel — so the deliverable is a from-source image build.
+#
+# Triggers:
+#   * push of a tag  v*      -> build both variants + publish ONE GitHub Release
+#   * workflow_dispatch      -> build both variants, upload artifacts (no release)
+#
+# Everything is pinned (OpenWrt rev, feed revs, kernel 6.18.34) for reproducibility;
+# bump OPENWRT_REF here and the feed revs in ci/feeds.conf together.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  OPENWRT_REF: 84f4f779204a3de631670fee69141188b56e4976   # OpenWrt main @ 2026-06-03, kernel 6.18.34
+  OPENWRT_URL: https://git.openwrt.org/openwrt/openwrt.git
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [lean, router]
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v4
+        with:
+          path: octeon-flowtable
+
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          large-packages: false
+
+      - name: Install OpenWrt build dependencies
+        run: |
+          sudo apt-get update
+          # NB: python3-distutils is gone on Ubuntu 24.04 (Python 3.12 dropped it);
+          # python3-setuptools covers OpenWrt's needs.
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3 python3-setuptools rsync unzip zlib1g-dev \
+            file wget swig time
+
+      - name: Clone OpenWrt at the pinned revision
+        run: |
+          git clone "$OPENWRT_URL" openwrt
+          cd openwrt
+          git checkout --detach "$OPENWRT_REF"
+          git --no-pager log -1 --format='OpenWrt %H %ci %s'
+
+      - name: Configure feeds (pinned packages+luci feeds + this repo as a src-link)
+        working-directory: openwrt
+        run: |
+          cp "$GITHUB_WORKSPACE/octeon-flowtable/ci/feeds.conf" feeds.conf
+          echo "src-link flowoffload $GITHUB_WORKSPACE/octeon-flowtable/package" >> feeds.conf
+          cat feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a -p flowoffload
+          # Make every package both variants might select available; defconfig picks per seed.
+          ./scripts/feeds install kmod-octeon-flowtable conntrack tcpdump \
+            luci luci-ssl luci-proto-wireguard wireguard-tools
+
+      - name: Drop in the staging hook patch + target tweaks
+        working-directory: openwrt
+        run: |
+          cp "$GITHUB_WORKSPACE/octeon-flowtable/src/staging-patches/120-octeon-flowtable-hooks.patch" \
+             target/linux/octeon/patches-6.18/
+          sh "$GITHUB_WORKSPACE/octeon-flowtable/ci/apply-target-tweaks.sh" "$PWD"
+
+      - name: Seed the config (${{ matrix.variant }})
+        working-directory: openwrt
+        run: |
+          case "${{ matrix.variant }}" in
+            lean)   seed=config.seed ;;
+            router) seed=config-router.seed ;;
+            *)      echo "unknown variant"; exit 1 ;;
+          esac
+          cp "$GITHUB_WORKSPACE/octeon-flowtable/ci/$seed" .config
+          make defconfig
+          grep -q '^CONFIG_PACKAGE_kmod-octeon-flowtable=y' .config \
+            || { echo "kmod-octeon-flowtable not selected — feed/package problem"; exit 1; }
+
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: dl-${{ env.OPENWRT_REF }}-${{ matrix.variant }}-${{ hashFiles('octeon-flowtable/ci/*.seed', 'octeon-flowtable/ci/feeds.conf') }}
+          restore-keys: dl-${{ env.OPENWRT_REF }}-
+
+      - name: Cache toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/staging_dir/toolchain-*
+            openwrt/build_dir/toolchain-*
+          key: toolchain-${{ env.OPENWRT_REF }}-${{ matrix.variant }}
+          restore-keys: toolchain-${{ env.OPENWRT_REF }}-
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make download -j$(nproc) V=s || make download -j1 V=s
+
+      - name: Build
+        working-directory: openwrt
+        run: |
+          make -j$(nproc) || {
+            echo "::warning::parallel build failed, retrying single-threaded for a readable log";
+            make -j1 V=sc;
+          }
+
+      - name: Collect output
+        working-directory: openwrt
+        run: |
+          out="$GITHUB_WORKSPACE/release"
+          mkdir -p "$out"
+          bin=bin/targets/octeon/generic
+          # Both variants build the same device, so image filenames collide — prefix
+          # everything with the variant name.
+          for f in $bin/*edgerouter-lite* $bin/packages/*octeon-flowtable*; do
+            [ -e "$f" ] && cp -v "$f" "$out/${{ matrix.variant }}-$(basename "$f")"
+          done
+          ( cd "$out" && sha256sum ${{ matrix.variant }}-* > "sha256sums-${{ matrix.variant }}.txt" )
+          echo "== ${{ matrix.variant }} release contents =="; ls -la "$out"
+          ls "$out/${{ matrix.variant }}-"*edgerouter-lite* >/dev/null 2>&1 \
+            || { echo "no edgerouter-lite image produced for ${{ matrix.variant }}"; exit 1; }
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.variant }}
+          path: release/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all variant artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          files=$(find dist -type f | sort)
+          echo "== release assets =="; echo "$files"
+          gh release create "${GITHUB_REF_NAME}" $files \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "octeon-flowtable ${GITHUB_REF_NAME}" \
+            --notes "Prebuilt OpenWrt images for the EdgeRouter Lite (Octeon+ CN5020) with the clean-room hardware flow offload.
+
+          Two variants (prefixed in the asset names):
+          - **lean** — offload + conntrack/tcpdump; a clean base to add your own packages to.
+          - **router** — lean + LuCI web UI + WireGuard, for a more turnkey home router.
+
+          Base: OpenWrt main @ \`${OPENWRT_REF}\` (kernel 6.18.34). Reproducible from this tag — see \`ci/\` and \`docs/BUILDING.md\`.
+
+          **Unofficial community image for EOL hardware — flash at your own risk.** The ERLite installs via USB stick / U-Boot, not web sysupgrade; recovery over U-Boot/TFTP is in \`docs/INSTALLING.md\`. Verify the \`sha256sums-*.txt\` before flashing."

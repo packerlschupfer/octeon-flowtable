@@ -1,0 +1,31 @@
+# 'router' variant seed — a more turnkey home-router image: LuCI web UI + WireGuard
+# on top of the hardware offload. Heavier than config.seed (the lean variant); still
+# a starting point, not a full gateway config. Built alongside the lean image by the
+# matrix in .github/workflows/build-image.yml.
+#
+# Seed only — the workflow copies it to openwrt/.config and runs `make defconfig`,
+# which pulls in the base router stack (dnsmasq, odhcpd, firewall4, ...) plus deps.
+
+# --- Target: EdgeRouter Lite only ---
+CONFIG_TARGET_octeon=y
+CONFIG_TARGET_octeon_generic=y
+CONFIG_TARGET_octeon_generic_DEVICE_ubnt_edgerouter-lite=y
+
+# --- Hardware flow offload ---
+CONFIG_PACKAGE_kmod-octeon-flowtable=y
+CONFIG_PACKAGE_kmod-nft-offload=y
+CONFIG_PACKAGE_kmod-nf-flow=y
+
+# --- Web UI (LuCI over https) ---
+CONFIG_PACKAGE_luci=y
+CONFIG_PACKAGE_luci-ssl=y
+
+# --- WireGuard VPN (transit WireGuard is itself offloaded — it's UDP) ---
+CONFIG_PACKAGE_kmod-wireguard=y
+CONFIG_PACKAGE_wireguard-tools=y
+CONFIG_PACKAGE_luci-proto-wireguard=y
+
+# --- Verify the offload is engaged ---
+CONFIG_PACKAGE_conntrack=y
+CONFIG_PACKAGE_kmod-nf-conntrack-netlink=y
+CONFIG_PACKAGE_tcpdump=y

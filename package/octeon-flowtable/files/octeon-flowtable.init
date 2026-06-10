@@ -1,0 +1,72 @@
+#!/bin/sh /etc/rc.common
+# Load + tune octeon_flowtable. The hardware flowtable itself comes from fw4:
+# set `option flow_offloading '1'` and `option flow_offloading_hw '1'` in
+# /etc/config/firewall — fw4 then installs an offloaded flowtable on the zone
+# devices and this module claims it. This script loads the module, applies the
+# tunables from /etc/config/octeon-flowtable, and pins the Ethernet group IRQs.
+
+START=99
+USE_PROCD=1
+
+PARAM_DIR=/sys/module/octeon_flowtable/parameters
+
+set_param() {
+	[ -w "$PARAM_DIR/$1" ] && echo "$2" > "$PARAM_DIR/$1"
+}
+
+spread_irqs() {
+	# one Ethernet group IRQ per CPU (round-robin smp_affinity bitmask)
+	local ncpu cpu=0 irq mask
+	ncpu=$(grep -c '^processor' /proc/cpuinfo)
+	[ "$ncpu" -gt 1 ] || return 0
+	for irq in $(awk -F: '/Ethernet/ {gsub(/ /, "", $1); print $1}' /proc/interrupts); do
+		mask=$(printf '%x' $((1 << cpu)))
+		echo "$mask" > "/proc/irq/$irq/smp_affinity" 2>/dev/null
+		cpu=$(((cpu + 1) % ncpu))
+	done
+}
+
+check_fw4_hw_offload() {
+	local v
+	v=$(uci -q get firewall.@defaults[0].flow_offloading_hw)
+	[ "$v" = "1" ] || logger -t octeon-flowtable \
+		"note: firewall flow_offloading_hw is not '1' — fw4 will not install a hardware flowtable; set it to accelerate forwarded flows"
+}
+
+start_service() {
+	config_load octeon-flowtable
+	local enabled irq_spread aqm_limit fau_stats verbose vlan_strict
+	config_get_bool enabled settings enabled 1
+	[ "$enabled" = 1 ] || return 0
+	config_get_bool irq_spread settings irq_spread 1
+	config_get aqm_limit settings aqm_limit 0
+	config_get_bool fau_stats settings fau_stats 0
+	config_get_bool verbose settings verbose 0
+	config_get_bool vlan_strict settings vlan_strict 0
+
+	modprobe octeon_flowtable 2>/dev/null
+	[ -d "$PARAM_DIR" ] || {
+		logger -t octeon-flowtable "module not loaded (missing staging hook patch?)"
+		return 1
+	}
+
+	set_param verbose "$verbose"
+	set_param fau_stats "$fau_stats"
+	set_param aqm_limit "$aqm_limit"
+	set_param vlan_strict "$vlan_strict"
+	[ "$irq_spread" = 1 ] && spread_irqs
+	check_fw4_hw_offload
+
+	# nothing to keep running; this is a oneshot tuner
+	procd_open_instance
+	procd_set_param command /bin/true
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger octeon-flowtable
+}
+
+reload_service() {
+	start_service
+}

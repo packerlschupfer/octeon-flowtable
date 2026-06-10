@@ -1,0 +1,204 @@
+--- a/drivers/staging/octeon/ethernet-rx.h	2026-06-01 17:51:08.000000000 +0200
++++ b/drivers/staging/octeon/ethernet-rx.h	2026-06-04 14:15:59.693532545 +0200
+@@ -9,6 +9,16 @@
+ void cvm_oct_rx_initialize(void);
+ void cvm_oct_rx_shutdown(void);
+ 
++/*
++ * WQE-level RX intercept hook for flow offload (octeon_flowtable). Called in
++ * the POW work loop before any skb is built. Return non-zero if the hook
++ * consumed the work entry (forwarded + freed it); zero to fall through to the
++ * normal Linux skb receive path. At most one hook may be registered.
++ */
++typedef int (*cvm_oct_rx_hook_t)(struct cvmx_wqe *work);
++void cvm_oct_register_rx_hook(cvm_oct_rx_hook_t hook);
++void cvm_oct_unregister_rx_hook(void);
++
+ static inline void cvm_oct_rx_refill_pool(int fill_threshold)
+ {
+ 	int number_to_free;
+--- a/drivers/staging/octeon/ethernet-rx.c	2026-06-01 17:51:08.000000000 +0200
++++ b/drivers/staging/octeon/ethernet-rx.c	2026-06-04 14:15:59.693532545 +0200
+@@ -31,6 +31,30 @@
+ 
+ static atomic_t oct_rx_ready = ATOMIC_INIT(0);
+ 
++/*
++ * Optional WQE-level RX intercept hook (flow offload). NULL when no consumer
++ * is registered. Read once per packet in the work loop; updated only via the
++ * register/unregister helpers below.
++ */
++static cvm_oct_rx_hook_t cvm_oct_rx_hook;
++
++void cvm_oct_register_rx_hook(cvm_oct_rx_hook_t hook)
++{
++	WRITE_ONCE(cvm_oct_rx_hook, hook);
++}
++EXPORT_SYMBOL(cvm_oct_register_rx_hook);
++
++void cvm_oct_unregister_rx_hook(void)
++{
++	WRITE_ONCE(cvm_oct_rx_hook, NULL);
++	/* Ensure no work loop is still inside a stale hook before the consumer
++	 * module unloads. NAPI runs in softirq; synchronize_net() waits out
++	 * in-flight softirq receivers.
++	 */
++	synchronize_net();
++}
++EXPORT_SYMBOL(cvm_oct_unregister_rx_hook);
++
+ static struct oct_rx_group {
+ 	int irq;
+ 	int group;
+@@ -277,6 +301,19 @@
+ 				continue;
+ 		}
+ 
++		/*
++		 * Flow-offload fast path: give a registered hook the raw work
++		 * entry before we build an skb. If it consumes the packet
++		 * (forwards via PKO and frees the buffers) we are done; else
++		 * fall through to the normal receive path below.
++		 */
++		{
++			cvm_oct_rx_hook_t hook = READ_ONCE(cvm_oct_rx_hook);
++
++			if (hook && hook(work))
++				continue;
++		}
++
+ 		/*
+ 		 * We can only use the zero copy path if skbuffs are
+ 		 * in the FPA pool and the packet fits in a single
+--- a/drivers/staging/octeon/ethernet-tx.c
++++ b/drivers/staging/octeon/ethernet-tx.c
+@@ -422,14 +422,21 @@
+ 		}
+ 	}
+ 
++	/* CVMX_PKO_LOCK_CMD_QUEUE, not LOCK_NONE: the flow-offload fast path
++	 * (cvm_oct_transmit_qos, called from NAPI on any core) writes the same
++	 * per-port PKO command queue. LOCK_NONE relies on the netdev tx lock,
++	 * which the fast path does not take — concurrent mixed-lock writers
++	 * corrupt the command queue (PKO then mis-frees FPA buffers; crashes
++	 * surface later as mangled WQEs/skbs in the receive path).
++	 */
+ 	cvmx_pko_send_packet_prepare(priv->port, priv->queue + qos,
+-				     CVMX_PKO_LOCK_NONE);
++				     CVMX_PKO_LOCK_CMD_QUEUE);
+ 
+ 	/* Send the packet to the output queue */
+ 	if (unlikely(cvmx_pko_send_packet_finish(priv->port,
+ 						 priv->queue + qos,
+ 						 pko_command, hw_buffer,
+-						 CVMX_PKO_LOCK_NONE))) {
++						 CVMX_PKO_LOCK_CMD_QUEUE))) {
+ 		printk_ratelimited("%s: Failed to send the packet\n",
+ 				   dev->name);
+ 		queue_type = QUEUE_DROP;
+@@ -498,6 +505,94 @@
+ }
+ 
+ /**
++ * cvm_oct_transmit_qos - transmit a raw work-queue entry's packet via PKO
++ * @dev:    egress octeon netdev (selects PKO port + base queue)
++ * @work_queue_entry: the cvmx_wqe whose packet buffer to transmit
++ * @do_free: if non-zero, PKO frees the packet buffer back to its FPA pool on
++ *           completion and this function frees the WQE descriptor; if zero,
++ *           neither is freed (caller retains ownership)
++ * @qos:    output queue offset within the port's queue range
++ *
++ * For flow-offload: forward a received WQE out @dev without building an skb.
++ * Single-segment (word2.bufs == 1) packets only; the caller must not pass
++ * multi-buffer work here. Returns 0 on success, -1 on PKO failure (the buffer
++ * and WQE are freed on failure when do_free is set, to avoid leaking).
++ */
++int cvm_oct_transmit_qos(struct net_device *dev, void *work_queue_entry,
++			 int do_free, int qos)
++{
++	struct octeon_ethernet *priv = netdev_priv(dev);
++	struct cvmx_wqe *work = work_queue_entry;
++	union cvmx_pko_command_word0 pko_command;
++	union cvmx_buf_ptr hw_buffer;
++
++	pko_command.u64 = 0;
++	pko_command.s.n2 = 1;	/* Don't pollute L2 with the outgoing packet */
++	pko_command.s.segs = work->word2.s.bufs;
++	pko_command.s.total_bytes = work->word1.len;
++	pko_command.s.dontfree = do_free ? 0 : 1;
++
++	if (cvm_oct_flow_aqm_fau) {
++		/* Tail-drop AQM input: PKO atomically subtracts this packet's
++		 * byte count from a per-port 64-bit in-flight FAU counter when it
++		 * transmits. The flow-offload module adds the same when queuing,
++		 * so the counter tracks bytes handed to PKO but not yet on the
++		 * wire. reg0 == 0 (the default) disables it. */
++		pko_command.s.reg0 = cvm_oct_flow_aqm_fau + priv->port * 8;
++		pko_command.s.size0 = CVMX_FAU_OP_SIZE_64;
++		pko_command.s.subone0 = 0;	/* subtract total_bytes */
++	}
++
++	hw_buffer = work->packet_ptr;
++
++	cvmx_pko_send_packet_prepare(priv->port, priv->queue + qos,
++				     CVMX_PKO_LOCK_CMD_QUEUE);
++
++	if (unlikely(cvmx_pko_send_packet_finish(priv->port, priv->queue + qos,
++						 pko_command, hw_buffer,
++						 CVMX_PKO_LOCK_CMD_QUEUE))) {
++		if (do_free)
++			cvm_oct_free_work(work);
++		return -1;
++	}
++
++	if (do_free) {
++		/* PKO frees the packet buffer (dontfree=0). Free the WQE
++		 * descriptor itself back to the WQE pool.
++		 */
++		cvmx_fpa_free(work, CVMX_FPA_WQE_POOL, 1);
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(cvm_oct_transmit_qos);
++
++/**
++ * cvm_oct_get_port - octeon PIP/PKO port number behind an octeon_ethernet netdev
++ * @dev: an octeon_ethernet net_device (caller must ensure this)
++ *
++ * Lets a flow-offload consumer key flows on the physical ingress port (the WQE
++ * reports the same number via cvmx_wqe_get_port), to disambiguate the same
++ * 5-tuple arriving on different ports. Returns priv->port.
++ */
++int cvm_oct_get_port(const struct net_device *dev)
++{
++	const struct octeon_ethernet *priv = netdev_priv(dev);
++
++	return priv->port;
++}
++EXPORT_SYMBOL(cvm_oct_get_port);
++
++/*
++ * Base FAU register for the flow-offload AQM per-port in-flight-bytes counters
++ * (counter for port p is at cvm_oct_flow_aqm_fau + p*8). 0 disables the FAU op
++ * in cvm_oct_transmit_qos. Set by the flow module; lives here so the TX path can
++ * read it without a per-call argument.
++ */
++int cvm_oct_flow_aqm_fau;
++EXPORT_SYMBOL(cvm_oct_flow_aqm_fau);
++
++/**
+  * cvm_oct_xmit_pow - transmit a packet to the POW
+  * @skb:    Packet to send
+  * @dev:    Device info structure
+--- a/drivers/staging/octeon/ethernet-tx.h	2026-06-01 17:51:08.000000000 +0200
++++ b/drivers/staging/octeon/ethernet-tx.h	2026-06-04 17:02:59.804358640 +0200
+@@ -9,6 +9,8 @@
+ netdev_tx_t cvm_oct_xmit_pow(struct sk_buff *skb, struct net_device *dev);
+ int cvm_oct_transmit_qos(struct net_device *dev, void *work_queue_entry,
+ 			 int do_free, int qos);
++int cvm_oct_get_port(const struct net_device *dev);
++extern int cvm_oct_flow_aqm_fau;
+ void cvm_oct_tx_initialize(void);
+ void cvm_oct_tx_shutdown(void);
+ void cvm_oct_tx_shutdown_dev(struct net_device *dev);

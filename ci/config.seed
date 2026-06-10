@@ -1,0 +1,24 @@
+# Lean image seed for the EdgeRouter Lite (Octeon+ CN5020) hardware-offload build.
+#
+# This is a SEED, not a full .config: the workflow copies it to openwrt/.config and
+# runs `make defconfig`, which expands it (toolchain, base system, dependencies) into
+# a complete config. Keep it minimal — it is meant to demonstrate the offload on a
+# clean base, NOT to reproduce any particular gateway's package selection. Add your
+# own packages downstream.
+
+# --- Target: EdgeRouter Lite only ---
+CONFIG_TARGET_octeon=y
+CONFIG_TARGET_octeon_generic=y
+CONFIG_TARGET_octeon_generic_DEVICE_ubnt_edgerouter-lite=y
+
+# --- The clean-room hardware flow offload ---
+# Pulls in its flowtable deps (kmod-nft-offload, kmod-nf-flow) via the package DEPENDS;
+# listed explicitly so they survive `make defconfig`.
+CONFIG_PACKAGE_kmod-octeon-flowtable=y
+CONFIG_PACKAGE_kmod-nft-offload=y
+CONFIG_PACKAGE_kmod-nf-flow=y
+
+# --- Handy for confirming the offload is engaged on the box ---
+CONFIG_PACKAGE_conntrack=y
+CONFIG_PACKAGE_kmod-nf-conntrack-netlink=y
+CONFIG_PACKAGE_tcpdump=y

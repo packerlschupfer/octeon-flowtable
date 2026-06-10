@@ -1,0 +1,4 @@
+table inet ftv6 {
+	flowtable f { hook ingress priority filter; devices = { eth1, eth2 }; flags offload; }
+	chain forward { type filter hook forward priority filter; policy accept; meta l4proto { tcp, udp } flow add @f; }
+}

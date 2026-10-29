@@ -37,6 +37,7 @@
 #include <linux/ethtool.h>
 #include <net/ip.h>
 #include <net/checksum.h>
+#include <linux/unaligned.h>
 #include <net/flow_offload.h>
 #include <net/netfilter/nf_flow_table.h>
 
@@ -296,6 +297,13 @@ struct octeon_ft_flow {
 	u8			n_eg;		/* egress tag count: 0, 1 or 2 */
 	u8			eport;		/* egress octeon port (AQM counter idx) */
 	u16			eg_vid[2];	/* wire order: [0]=outer, [1]=inner */
+	/* Egress PPPoE session (FLOW_ACTION_PPPOE_PUSH): the 8-byte PPPoE+PPP
+	 * header goes inside the VLAN tags. sess indexes the learned-session
+	 * table (ingress PPPoE frames are only accepted for known sessions);
+	 * -1 = no PPPoE. */
+	bool			eg_ppp;
+	s8			sess;
+	u16			eg_sid;		/* host order */
 	/* per-flow accounting (fed back to nftables flowtable stats so offloaded
 	 * traffic stays visible in `conntrack -L` and the flow is kept alive).
 	 */
@@ -369,6 +377,7 @@ static atomic_t octeon_ft_r_wqe = ATOMIC_INIT(0);
 static atomic_t octeon_ft_r_ipoff = ATOMIC_INIT(0);
 static atomic_t octeon_ft_r_ctl = ATOMIC_INIT(0);
 static atomic_t octeon_ft_r_miss = ATOMIC_INIT(0);
+static atomic_t octeon_ft_r_ppp = ATOMIC_INIT(0);
 module_param_cb(r_bufs, &octeon_ft_atomic_ops, &octeon_ft_r_bufs, 0444);
 MODULE_PARM_DESC(r_bufs, "rejects: multi-buffer WQE");
 module_param_cb(r_wqe, &octeon_ft_atomic_ops, &octeon_ft_r_wqe, 0444);
@@ -379,6 +388,8 @@ module_param_cb(r_ctl, &octeon_ft_atomic_ops, &octeon_ft_r_ctl, 0444);
 MODULE_PARM_DESC(r_ctl, "rejects: TCP syn/fin/rst punted");
 module_param_cb(r_miss, &octeon_ft_atomic_ops, &octeon_ft_r_miss, 0444);
 MODULE_PARM_DESC(r_miss, "rejects: flow table lookup miss");
+module_param_cb(r_ppp, &octeon_ft_atomic_ops, &octeon_ft_r_ppp, 0444);
+MODULE_PARM_DESC(r_ppp, "rejects: PPPoE frame malformed or not a learned session");
 
 /* ============================ data path ============================ */
 
@@ -432,39 +443,161 @@ static inline bool octeon_ft_has_headroom(struct cvmx_wqe *work, int need)
 	       work->packet_ptr.s.back >= 1;
 }
 
+/* PPPoE session header (RFC 2516) + PPP protocol field, inside any VLAN tags. */
+#define OCT_PPPOE_HLEN	8		/* ver/type, code, sid, length, PPP proto */
+#define OCT_PPP_IPV4	0x0021
+#define OCT_PPP_IPV6	0x0057
+
 /*
- * Rewrite the ingress 802.1Q tag stack (n_ig tags) to the egress stack
- * (n_eg tags, VIDs in eg_vid[] wire order). One mechanism for every
- * retag/pop/push/QinQ combination:
- *
- *   shift = (n_ig - n_eg) * 4    bytes the dst+src MAC moves (forward=pop net,
- *                                backward=push net); L3 and the ethertype never
- *                                move (ip_offset already points at L3).
- *
- * Then write the n_eg egress tags in the opened slot. The tag bytes are not
- * covered by the IP/L4 checksums, so nothing else changes. Finally fix the FPA
- * buffer pointer (addr/size/len) and, only if the ±shift crosses a cache line,
- * buf_ptr.back (wrong back corrupts the FPA pool). |shift| <= 8, so at most one
- * crossing. Caller guarantees headroom for a net push.
+ * Learned PPPoE sessions. A flowtable rule for a flow LEAVING via a PPPoE
+ * device carries FLOW_ACTION_PPPOE_PUSH{sid}, its egress port/VLAN stack and the
+ * concentrator's MAC (the dmac mangle). The kernel emits no PPPoE match/pop for
+ * the opposite direction, so the return flow is keyed on the inner 5-tuple
+ * only; to keep the kernel's pppoe_rcv guarantee (frame must belong to an
+ * established session from its peer) the RX hook only accepts PPPoE frames
+ * whose port+VLANs+sid+source MAC match a session some egress flow is using.
+ * Refcounted per flow; a handful of slots (one WAN session is the norm).
+ * Lockless readers: key and MAC are single u64 words; a torn read can only
+ * mismatch (slow path), never falsely match a slot.
  */
-static inline void octeon_ft_vlan_xform(struct cvmx_wqe *work, u8 *l2,
-					int n_ig, int n_eg, const u16 *eg_vid)
+#define OCT_FT_PPPOE_SESS	4
+
+struct octeon_ft_pppoe_sess {
+	u64	key;		/* 0 = free; see octeon_ft_sess_key */
+	u64	mac;
+	int	refs;		/* under octeon_ft_sess_lock */
+};
+
+static struct octeon_ft_pppoe_sess octeon_ft_sess[OCT_FT_PPPOE_SESS];
+static DEFINE_SPINLOCK(octeon_ft_sess_lock);
+static atomic_t octeon_ft_sess_active = ATOMIC_INIT(0);
+module_param_cb(pppoe_sessions, &octeon_ft_atomic_ops, &octeon_ft_sess_active, 0444);
+MODULE_PARM_DESC(pppoe_sessions, "learned PPPoE sessions in use by offloaded flows");
+
+static inline u64 octeon_ft_sess_key(u16 port, u16 vid0, u16 vid1, u16 sid)
 {
-	int shift = (n_ig - n_eg) * OCT_VLAN_HLEN;
-	u8 *m = l2 + shift;
+	return BIT_ULL(63) | (u64)port << 40 | (u64)(vid0 & 0xfff) << 28 |
+	       (u64)(vid1 & 0xfff) << 16 | sid;
+}
+
+static inline u64 octeon_ft_mac64(const u8 *m)
+{
+	return (u64)m[0] << 40 | (u64)m[1] << 32 | (u64)m[2] << 24 |
+	       (u64)m[3] << 16 | (u64)m[4] << 8 | m[5];
+}
+
+/* Returns the slot index, or -1 if the table is full. */
+static int octeon_ft_sess_get(u64 key, u64 mac)
+{
+	int i, freei = -1;
+
+	spin_lock_bh(&octeon_ft_sess_lock);
+	for (i = 0; i < OCT_FT_PPPOE_SESS; i++) {
+		struct octeon_ft_pppoe_sess *e = &octeon_ft_sess[i];
+
+		if (e->refs && e->key == key && e->mac == mac) {
+			e->refs++;
+			goto out;
+		}
+		if (!e->refs && freei < 0)
+			freei = i;
+	}
+	i = freei;
+	if (i >= 0) {
+		struct octeon_ft_pppoe_sess *e = &octeon_ft_sess[i];
+
+		WRITE_ONCE(e->mac, mac);
+		smp_wmb();		/* MAC visible before the key arms the slot */
+		WRITE_ONCE(e->key, key);
+		e->refs = 1;
+		atomic_inc(&octeon_ft_sess_active);
+	}
+out:
+	spin_unlock_bh(&octeon_ft_sess_lock);
+	return i;
+}
+
+static void octeon_ft_sess_put(int i)
+{
+	spin_lock_bh(&octeon_ft_sess_lock);
+	if (!--octeon_ft_sess[i].refs) {
+		WRITE_ONCE(octeon_ft_sess[i].key, 0);
+		atomic_dec(&octeon_ft_sess_active);
+	}
+	spin_unlock_bh(&octeon_ft_sess_lock);
+}
+
+static inline bool octeon_ft_sess_ok(u64 key, u64 mac)
+{
+	int i;
+
+	for (i = 0; i < OCT_FT_PPPOE_SESS; i++)
+		if (READ_ONCE(octeon_ft_sess[i].key) == key &&
+		    READ_ONCE(octeon_ft_sess[i].mac) == mac)
+			return true;
+	return false;
+}
+
+/*
+ * Rewrite the ingress L2 encapsulation to the flow's egress one, in the FPA
+ * buffer. The L2 header between the MACs and L3 is
+ *
+ *	[n x 802.1Q tag][ethertype][PPPoE session hdr + PPP proto]?
+ *
+ * on both sides (ingress: n_ig tags, PPPoE if ig_ppp; egress: flow->n_eg tags
+ * with eg_vid[] in wire order, PPPoE if flow->eg_ppp). One mechanism covers
+ * every retag/pop/push/QinQ and PPPoE encap/decap combination:
+ *
+ *   shift = hlen_in - hlen_out   bytes the dst+src MAC moves (forward = net
+ *                                pop, backward = net push); L3 never moves.
+ *
+ * Then write the egress tags, ethertype and PPPoE header in the opened slot.
+ * None of it is covered by the IP/L4 checksums. The PPPoE length is the PPP
+ * payload (IP length) + the 2-byte PPP protocol field. Finally fix the FPA
+ * buffer pointer (addr/size/len) and, only if the shift crosses a cache line,
+ * buf_ptr.back (wrong back corrupts the FPA pool). |shift| <= 16, so at most
+ * one crossing. Caller guarantees headroom for a net push.
+ */
+static inline void octeon_ft_l2_xform(struct cvmx_wqe *work, u8 *l2, int n_ig,
+				      bool ig_ppp,
+				      const struct octeon_ft_flow *flow,
+				      bool v6, unsigned int ip_len)
+{
+	int hin = n_ig * OCT_VLAN_HLEN + (ig_ppp ? OCT_PPPOE_HLEN : 0);
+	int hout = flow->n_eg * OCT_VLAN_HLEN + (flow->eg_ppp ? OCT_PPPOE_HLEN : 0);
+	int shift = hin - hout;
+	u8 *m = l2 + shift, *p;
 	u64 addr = work->packet_ptr.s.addr;
 	int k;
 
 	if (shift)
 		memmove(m, l2, 2 * ETH_ALEN);
-	for (k = 0; k < n_eg; k++) {
-		u8 *t = m + 2 * ETH_ALEN + k * OCT_VLAN_HLEN;
-
-		t[0] = (ETH_P_8021Q >> 8) & 0xff;	/* TPID 0x8100 */
-		t[1] = ETH_P_8021Q & 0xff;
-		t[2] = (eg_vid[k] >> 8) & 0x0f;		/* PCP/DEI 0 | VID[11:8] */
-		t[3] = eg_vid[k] & 0xff;		/* VID[7:0] */
+	p = m + 2 * ETH_ALEN;
+	for (k = 0; k < flow->n_eg; k++, p += OCT_VLAN_HLEN) {
+		p[0] = (ETH_P_8021Q >> 8) & 0xff;	/* TPID 0x8100 */
+		p[1] = ETH_P_8021Q & 0xff;
+		p[2] = (flow->eg_vid[k] >> 8) & 0x0f;	/* PCP/DEI 0 | VID[11:8] */
+		p[3] = flow->eg_vid[k] & 0xff;		/* VID[7:0] */
 	}
+	if (flow->eg_ppp) {
+		u16 ppp_len = ip_len + 2;
+
+		p[0] = (ETH_P_PPP_SES >> 8) & 0xff;
+		p[1] = ETH_P_PPP_SES & 0xff;
+		p[2] = 0x11;				/* ver 1, type 1 */
+		p[3] = 0x00;				/* code: session data */
+		p[4] = flow->eg_sid >> 8;
+		p[5] = flow->eg_sid & 0xff;
+		p[6] = ppp_len >> 8;
+		p[7] = ppp_len & 0xff;
+		p[8] = 0x00;
+		p[9] = v6 ? OCT_PPP_IPV6 : OCT_PPP_IPV4;
+	} else if (ig_ppp) {
+		/* decap: the ethertype slot held 0x8864 */
+		p[0] = v6 ? 0x86 : 0x08;
+		p[1] = v6 ? 0xdd : 0x00;
+	}
+	/* else: plain in, plain out - the original ethertype is still in place */
 	if (!shift)
 		return;
 	if (shift > 0) {	/* net pop: addr advances, frame shrinks */
@@ -479,6 +612,14 @@ static inline void octeon_ft_vlan_xform(struct cvmx_wqe *work, u8 *l2,
 	work->word1.len -= shift;
 }
 
+/* Bytes the egress L2 header grows by vs the ingress one (<= 0: no push). */
+static inline int octeon_ft_l2_grow(const struct octeon_ft_flow *flow, int n_ig,
+				    bool ig_ppp)
+{
+	return (flow->n_eg - n_ig) * OCT_VLAN_HLEN +
+	       ((flow->eg_ppp ? OCT_PPPOE_HLEN : 0) - (ig_ppp ? OCT_PPPOE_HLEN : 0));
+}
+
 /*
  * IPv6 fast path. v6 is routed, never NAT'd (the flowtable presents only eth
  * MAC mangles + REDIRECT — verified on hardware), so the rewrite is just dst/src
@@ -489,7 +630,7 @@ static inline void octeon_ft_vlan_xform(struct cvmx_wqe *work, u8 *l2,
  * IP_exc / is_frag and are rejected upstream). Returns 1 if consumed.
  */
 static int octeon_ft_rx6(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
-			 int n_ig)
+			 int n_ig, u16 vid0, u16 vid1, bool ig_ppp)
 {
 	struct ipv6hdr *ip6 = (struct ipv6hdr *)l3;
 	struct octeon_ft_flow *flow;
@@ -517,11 +658,8 @@ static int octeon_ft_rx6(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 	key.l4proto = ip6->nexthdr;
 	key.sport = *(__be16 *)(l4 + 0);
 	key.dport = *(__be16 *)(l4 + 2);
-	key.vlan_id = work->word2.s.vlan_valid ? work->word2.s.vlan_id : 0;
-	if (n_ig == 2)
-		key.vlan_id2 = (((u16)l2[ip_off - 4] << 8) |
-				l2[ip_off - 3]) & 0x0fff;
-
+	key.vlan_id = vid0;
+	key.vlan_id2 = vid1;
 	key.iif_port = cvmx_wqe_get_port(work);
 
 	rcu_read_lock();
@@ -546,8 +684,8 @@ static int octeon_ft_rx6(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 		rcu_read_unlock();
 		return 0;
 	}
-	if (flow->n_eg > n_ig &&
-	    !octeon_ft_has_headroom(work, (flow->n_eg - n_ig) * OCT_VLAN_HLEN)) {
+	if (octeon_ft_l2_grow(flow, n_ig, ig_ppp) > 0 &&
+	    !octeon_ft_has_headroom(work, octeon_ft_l2_grow(flow, n_ig, ig_ppp))) {
 		rcu_read_unlock();
 		return 0;
 	}
@@ -560,7 +698,8 @@ static int octeon_ft_rx6(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 
 	atomic_inc(&octeon_ft_hits);
 	od = flow->out_dev;
-	octeon_ft_vlan_xform(work, l2, n_ig, flow->n_eg, flow->eg_vid);
+	octeon_ft_l2_xform(work, l2, n_ig, ig_ppp, flow, true,
+			   sizeof(*ip6) + ntohs(ip6->payload_len));
 	fb = work->word1.len;
 
 	/* Tail-drop AQM: bound the egress port's in-flight bytes. */
@@ -587,74 +726,20 @@ static int octeon_ft_rx6(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 	return 1;
 }
 
-/* The registered RX hook. Return 1 if consumed, 0 to fall through. */
-static int octeon_ft_rx(struct cvmx_wqe *work)
+/*
+ * IPv4 fast path, from a located + validated L3 header: lookup, NAT rewrite,
+ * L2 encap rewrite, PKO transmit. Shared by the PIP-parsed path (octeon_ft_rx)
+ * and the PPPoE path (octeon_ft_rx_pppoe). Returns 1 if consumed.
+ */
+static int octeon_ft_fwd4(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
+			  int n_ig, u16 vid0, u16 vid1, bool ig_ppp)
 {
+	struct iphdr *iph = (struct iphdr *)l3;
 	struct octeon_ft_flow *flow;
 	struct octeon_ft_key key;
-	struct iphdr *iph;
-	u8 *l2, *l3, *l4;
-	int ihl, ip_off, n_ig;
+	u8 *l4;
+	int ihl;
 
-	/* Cheap rejects from the PIP-parsed WQE (no memory touch). */
-	if (work->word2.s.bufs != 1) {
-		atomic_inc(&octeon_ft_r_bufs);
-		return 0;
-	}
-
-	/* Diagnostic (verbose): dump PIP's parse for ANY 802.1Q-tagged frame
-	 * (detected from the buffer, independent of PIP's vlan flags), to
-	 * characterize how a stacked tag is reported (ip_offset, vlan_stacked,
-	 * not_IP, tcp_or_udp) and where L3 actually starts in head[]. */
-	if (octeon_ft_verbose) {
-		u8 *p = octeon_ft_pkt_data(work);
-
-		if (work->word1.len >= ETH_HLEN &&
-		    p[12] == 0x81 && p[13] == 0x00) {
-			static atomic_t dn = ATOMIC_INIT(0);
-
-			if (atomic_inc_return(&dn) <= 16)
-				pr_info(DRV_NAME ": WQE vvalid=%u vid=%u stk=%u ipoff=%u notIP=%u tu=%u len=%u head=%*ph\n",
-					work->word2.s.vlan_valid,
-					work->word2.s.vlan_id,
-					work->word2.s.vlan_stacked,
-					work->word2.s.ip_offset,
-					work->word2.s.not_IP,
-					work->word2.s.tcp_or_udp,
-					work->word1.len, 32, p);
-		}
-	}
-
-	/* L4_error: PIP flagged a malformed L4 (truncated TCP/UDP header, UDP
-	 * length overrunning the IP payload, port 0, bad checksum, illegal flag
-	 * combos). Reading ports/flags from such a header would build a key
-	 * from garbage and could fast-forward a packet the stack would drop.
-	 * With this check, PIP guarantees the L4 header is in bounds.
-	 */
-	if (work->word2.snoip.rcv_error || work->word2.s.not_IP ||
-	    work->word2.s.IP_exc || work->word2.s.is_frag ||
-	    work->word2.s.L4_error || !work->word2.s.tcp_or_udp) {
-		atomic_inc(&octeon_ft_r_wqe);
-		return 0;
-	}
-
-	l2 = octeon_ft_pkt_data(work);
-	ip_off = work->word2.s.ip_offset;	/* PIP counts every 802.1Q tag */
-	n_ig = octeon_ft_n_ingress_tags(work);
-	/* L3 must sit exactly past the L2 header + n_ig tags. Anything else
-	 * (e.g. 3+ stacked tags, which PIP still flags as stacked but whose
-	 * ip_off is 26) is out of scope -> slow path. */
-	if (ip_off != ETH_HLEN + n_ig * OCT_VLAN_HLEN) {
-		atomic_inc(&octeon_ft_r_ipoff);
-		return 0;
-	}
-	l3 = l2 + ip_off;
-	iph = (struct iphdr *)l3;
-	if (iph->version != 4) {
-		if (iph->version == 6)
-			return octeon_ft_rx6(work, l2, l3, ip_off, n_ig);
-		return 0;
-	}
 	ihl = iph->ihl * 4;
 	/* PIP's IP_exc covers a bad IHL; keep an explicit floor anyway so L4
 	 * can never be computed inside the IP header (one compare, ~free). */
@@ -689,12 +774,8 @@ static int octeon_ft_rx(struct cvmx_wqe *work)
 	/* TCP and UDP both have src/dst port as the first two 16-bit words. */
 	key.sport = *(__be16 *)(l4 + 0);
 	key.dport = *(__be16 *)(l4 + 2);
-	key.vlan_id = work->word2.s.vlan_valid ? work->word2.s.vlan_id : 0;
-	if (n_ig == 2)
-		/* inner tag TCI is the 2 bytes just before L3's ethertype,
-		 * i.e. at l2 + ip_off - 4. */
-		key.vlan_id2 = (((u16)l2[ip_off - 4] << 8) |
-				l2[ip_off - 3]) & 0x0fff;
+	key.vlan_id = vid0;
+	key.vlan_id2 = vid1;
 
 	key.iif_port = cvmx_wqe_get_port(work);
 
@@ -738,8 +819,8 @@ static int octeon_ft_rx(struct cvmx_wqe *work)
 	 * anything, so a no-room case falls back to the slow path pristine (no
 	 * double-NAT).
 	 */
-	if (flow->n_eg > n_ig &&
-	    !octeon_ft_has_headroom(work, (flow->n_eg - n_ig) * OCT_VLAN_HLEN)) {
+	if (octeon_ft_l2_grow(flow, n_ig, ig_ppp) > 0 &&
+	    !octeon_ft_has_headroom(work, octeon_ft_l2_grow(flow, n_ig, ig_ppp))) {
 		rcu_read_unlock();
 		return 0;
 	}
@@ -800,7 +881,8 @@ static int octeon_ft_rx(struct cvmx_wqe *work)
 		 * push / QinQ, any combination). The tags are not covered by the
 		 * IP/L4 checksums, so this never touches the checksums.
 		 */
-		octeon_ft_vlan_xform(work, l2, n_ig, flow->n_eg, flow->eg_vid);
+		octeon_ft_l2_xform(work, l2, n_ig, ig_ppp, flow, false,
+				   ntohs(iph->tot_len));
 		fb = work->word1.len;	/* egress length (post tag xform) */
 
 		/* Tail-drop AQM: bound the egress port's in-flight bytes. */
@@ -830,6 +912,169 @@ static int octeon_ft_rx(struct cvmx_wqe *work)
 	}
 	rcu_read_unlock();
 	return 1;
+}
+
+/*
+ * PPPoE session frames (ethertype 0x8864, optionally inside 1-2 802.1Q tags).
+ * PIP does not parse PPPoE on CN50xx (not_IP, nothing validated), so parse and
+ * validate here what PIP would have: PPPoE/PPP header, a learned session from
+ * the right peer (see octeon_ft_sess_*), and a sane, unfragmented IPv4/IPv6
+ * header with the L4 header inside the datagram. Then share the IP fast paths.
+ * Returns 1 if consumed.
+ */
+static int octeon_ft_rx_pppoe(struct cvmx_wqe *work)
+{
+	u8 *l2 = octeon_ft_pkt_data(work), *ph, *l3;
+	unsigned int len = work->word1.len, off = 2 * ETH_ALEN, avail, plen;
+	u16 vid[2] = { 0, 0 }, et, sid, proto;
+	int n = 0, ip_off;
+
+	if (len < off + 2)
+		return 0;
+	et = get_unaligned_be16(l2 + off);
+	while (et == ETH_P_8021Q) {
+		if (n == 2 || len < off + 6)
+			return 0;
+		vid[n++] = get_unaligned_be16(l2 + off + 2) & 0x0fff;
+		off += OCT_VLAN_HLEN;
+		et = get_unaligned_be16(l2 + off);
+	}
+	if (et != ETH_P_PPP_SES)
+		return 0;
+	ph = l2 + off + 2;
+	ip_off = off + 2 + OCT_PPPOE_HLEN;
+	if (len < ip_off + sizeof(struct iphdr))
+		goto bad;
+	if (ph[0] != 0x11 || ph[1] != 0x00)		/* ver/type 1/1, session data */
+		goto bad;
+	sid = get_unaligned_be16(ph + 2);
+	plen = get_unaligned_be16(ph + 4);		/* PPP proto + PPP payload */
+	proto = get_unaligned_be16(ph + 6);
+	if (plen < 2 || ip_off - 2 + plen > len)
+		goto bad;
+	avail = plen - 2;
+	if (!octeon_ft_sess_ok(octeon_ft_sess_key(cvmx_wqe_get_port(work),
+						  vid[0], vid[1], sid),
+			       octeon_ft_mac64(l2 + ETH_ALEN)))
+		goto bad;
+	l3 = l2 + ip_off;
+
+	if (proto == OCT_PPP_IPV4) {
+		struct iphdr *iph = (struct iphdr *)l3;
+		unsigned int ihl, tot;
+
+		if (iph->version != 4)
+			goto bad;
+		ihl = iph->ihl * 4;
+		tot = ntohs(iph->tot_len);
+		if (ihl < sizeof(*iph) || tot < ihl || tot > avail ||
+		    ip_is_fragment(iph) || ip_fast_csum(iph, iph->ihl))
+			goto bad;
+		if (!(iph->protocol == IPPROTO_TCP &&
+		      tot >= ihl + sizeof(struct tcphdr)) &&
+		    !(iph->protocol == IPPROTO_UDP &&
+		      tot >= ihl + sizeof(struct udphdr)))
+			return 0;
+		return octeon_ft_fwd4(work, l2, l3, ip_off, n, vid[0], vid[1], true);
+	}
+	if (proto == OCT_PPP_IPV6) {
+		struct ipv6hdr *ip6 = (struct ipv6hdr *)l3;
+		unsigned int pl;
+
+		if (avail < sizeof(*ip6) || ip6->version != 6)
+			goto bad;
+		pl = ntohs(ip6->payload_len);
+		if (sizeof(*ip6) + pl > avail)
+			goto bad;
+		if (!(ip6->nexthdr == IPPROTO_TCP && pl >= sizeof(struct tcphdr)) &&
+		    !(ip6->nexthdr == IPPROTO_UDP && pl >= sizeof(struct udphdr)))
+			return 0;
+		return octeon_ft_rx6(work, l2, l3, ip_off, n, vid[0], vid[1], true);
+	}
+	return 0;		/* LCP/IPCP/... -> pppd via the slow path */
+bad:
+	atomic_inc(&octeon_ft_r_ppp);
+	return 0;
+}
+
+/* The registered RX hook. Return 1 if consumed, 0 to fall through. */
+static int octeon_ft_rx(struct cvmx_wqe *work)
+{
+	u16 vid0, vid1 = 0;
+	u8 *l2, *l3;
+	int ip_off, n_ig;
+
+	/* Cheap rejects from the PIP-parsed WQE (no memory touch). */
+	if (work->word2.s.bufs != 1) {
+		atomic_inc(&octeon_ft_r_bufs);
+		return 0;
+	}
+
+	/* Diagnostic (verbose): dump PIP's parse for ANY 802.1Q-tagged frame
+	 * (detected from the buffer, independent of PIP's vlan flags), to
+	 * characterize how a stacked tag is reported (ip_offset, vlan_stacked,
+	 * not_IP, tcp_or_udp) and where L3 actually starts in head[]. */
+	if (octeon_ft_verbose) {
+		u8 *p = octeon_ft_pkt_data(work);
+
+		if (work->word1.len >= ETH_HLEN &&
+		    p[12] == 0x81 && p[13] == 0x00) {
+			static atomic_t dn = ATOMIC_INIT(0);
+
+			if (atomic_inc_return(&dn) <= 16)
+				pr_info(DRV_NAME ": WQE vvalid=%u vid=%u stk=%u ipoff=%u notIP=%u tu=%u len=%u head=%*ph\n",
+					work->word2.s.vlan_valid,
+					work->word2.s.vlan_id,
+					work->word2.s.vlan_stacked,
+					work->word2.s.ip_offset,
+					work->word2.s.not_IP,
+					work->word2.s.tcp_or_udp,
+					work->word1.len, 32, p);
+		}
+	}
+
+	/* Not IP to PIP: the only non-IP frames we forward are PPPoE session
+	 * frames, and only while some offloaded flow egresses via PPPoE. */
+	if (work->word2.snoip.not_IP && !work->word2.snoip.rcv_error &&
+	    atomic_read(&octeon_ft_sess_active))
+		return octeon_ft_rx_pppoe(work);
+
+	/* L4_error: PIP flagged a malformed L4 (truncated TCP/UDP header, UDP
+	 * length overrunning the IP payload, port 0, bad checksum, illegal flag
+	 * combos). Reading ports/flags from such a header would build a key
+	 * from garbage and could fast-forward a packet the stack would drop.
+	 * With this check, PIP guarantees the L4 header is in bounds.
+	 */
+	if (work->word2.snoip.rcv_error || work->word2.s.not_IP ||
+	    work->word2.s.IP_exc || work->word2.s.is_frag ||
+	    work->word2.s.L4_error || !work->word2.s.tcp_or_udp) {
+		atomic_inc(&octeon_ft_r_wqe);
+		return 0;
+	}
+
+	l2 = octeon_ft_pkt_data(work);
+	ip_off = work->word2.s.ip_offset;	/* PIP counts every 802.1Q tag */
+	n_ig = octeon_ft_n_ingress_tags(work);
+	/* L3 must sit exactly past the L2 header + n_ig tags. Anything else
+	 * (e.g. 3+ stacked tags, which PIP still flags as stacked but whose
+	 * ip_off is 26) is out of scope -> slow path. */
+	if (ip_off != ETH_HLEN + n_ig * OCT_VLAN_HLEN) {
+		atomic_inc(&octeon_ft_r_ipoff);
+		return 0;
+	}
+	l3 = l2 + ip_off;
+	vid0 = work->word2.s.vlan_valid ? work->word2.s.vlan_id : 0;
+	if (n_ig == 2)
+		/* inner tag TCI is the 2 bytes just before L3's ethertype,
+		 * i.e. at l2 + ip_off - 4. */
+		vid1 = (((u16)l2[ip_off - 4] << 8) | l2[ip_off - 3]) & 0x0fff;
+	switch (((struct iphdr *)l3)->version) {
+	case 4:
+		return octeon_ft_fwd4(work, l2, l3, ip_off, n_ig, vid0, vid1, false);
+	case 6:
+		return octeon_ft_rx6(work, l2, l3, ip_off, n_ig, vid0, vid1, false);
+	}
+	return 0;
 }
 
 /* ============================ control path ============================ */
@@ -1101,6 +1346,7 @@ static struct octeon_ft_flow *octeon_ft_parse(struct flow_cls_offload *f)
 		return ERR_PTR(-ENOMEM);
 
 	flow->is_v6 = is_v6;
+	flow->sess = -1;
 	flow->cookie = f->cookie;
 	flow_rule_match_ports(rule, &ports);
 	if (is_v6) {
@@ -1159,6 +1405,17 @@ static struct octeon_ft_flow *octeon_ft_parse(struct flow_cls_offload *f)
 				goto unsupported;
 			push_vid[n_push++] = act->vlan.vid;
 			break;
+		case FLOW_ACTION_PPPOE_PUSH:
+			/* Egress via a PPPoE device: the REDIRECT dev is the
+			 * physical port (DIRECT xmit), the dmac mangle is the
+			 * concentrator, and any VLAN the session runs on comes
+			 * as VLAN_PUSH (outside the PPPoE header).
+			 */
+			if (flow->eg_ppp)
+				goto unsupported;
+			flow->eg_ppp = true;
+			flow->eg_sid = act->pppoe.sid;
+			break;
 		case FLOW_ACTION_VLAN_POP:
 			/* Ingress tag consumption; the ingress stack is keyed
 			 * via FLOW_DISSECTOR_KEY_VLAN below, and the hook's
@@ -1192,6 +1449,12 @@ static struct octeon_ft_flow *octeon_ft_parse(struct flow_cls_offload *f)
 	 * physical port's. Cached at install like the sw flowtable's route MTU;
 	 * an MTU change is picked up when the flow is re-offloaded. */
 	flow->mtu = READ_ONCE(redir->mtu);
+	/* PPPoE: the REDIRECT dev is the physical port; the session header
+	 * eats 8 bytes of its MTU (1500 -> 1492). The ppp device's own (maybe
+	 * lower) MTU is not in the rule; packets above it but within 1492 are
+	 * still carried by the link. */
+	if (flow->eg_ppp)
+		flow->mtu -= OCT_PPPOE_HLEN;
 	flow->eport = cvm_oct_get_port(flow->out_dev);	/* AQM counter index */
 	flow->n_eg = octeon_ft_vlan_stack(redir, vids);
 	if (flow->n_eg >= 1)		/* eg_vid[] is zero (kzalloc) otherwise */
@@ -1276,6 +1539,21 @@ static struct octeon_ft_flow *octeon_ft_parse(struct flow_cls_offload *f)
 	if (!got_iif)
 		goto unsupported;
 
+	/* Learn the PPPoE session this flow transmits on, so the RX hook
+	 * accepts the session's return frames (port + VLAN stack + sid + the
+	 * concentrator's MAC as source). Last fallible step: on success the
+	 * reference is dropped in octeon_ft_flow_free. */
+	if (flow->eg_ppp) {
+		if (!flow->rw.set_dmac)
+			goto unsupported;
+		flow->sess = octeon_ft_sess_get(
+			octeon_ft_sess_key(flow->eport, flow->eg_vid[0],
+					   flow->eg_vid[1], flow->eg_sid),
+			octeon_ft_mac64(flow->rw.dmac));
+		if (flow->sess < 0)
+			goto unsupported;
+	}
+
 	/* The RX hook dereferences out_dev from softirq with only RCU pinning
 	 * the flow entry — pin the netdev itself for the flow's lifetime. The
 	 * ref is dropped in octeon_ft_flow_free (RCU-deferred on the data-path
@@ -1294,6 +1572,8 @@ unsupported:
  */
 static void octeon_ft_flow_free(struct octeon_ft_flow *flow)
 {
+	if (flow->sess >= 0)
+		octeon_ft_sess_put(flow->sess);
 	dev_put(flow->out_dev);
 	kfree(flow);
 }

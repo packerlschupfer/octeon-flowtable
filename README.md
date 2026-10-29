@@ -26,7 +26,8 @@ vendor it reverse-engineered.
 ## What it accelerates
 
 IPv4 + IPv6, NAT + routing, untagged + **802.1Q VLAN** (retag / pop / push) +
-**QinQ** (two tags) — all hardware-verified. Plus a global hardware FAU counter
+**QinQ** (two tags) + **PPPoE** (encap/decap, also PPPoE-over-VLAN; ~915 / 925
+Mbit/s up / down on the bench) — all hardware-verified. Plus a global hardware FAU counter
 and a **PKO tail-drop AQM** that cuts bufferbloat 54 ms → 4 ms at equal
 throughput. See [`docs/PROJECT-OUTCOME.md`](docs/PROJECT-OUTCOME.md) and
 [`docs/FUTURE-WORK.md`](docs/FUTURE-WORK.md) for the full matrix.
@@ -99,6 +100,17 @@ The suite's preflight self-heals its topology (a `wan` netns endpoint and a
 tagged client subif). The remaining `tests/*.nft` files and `*-rig.sh` scripts
 are the standalone topology rigs used during VLAN/QinQ/IPv6 bring-up.
 
+PPPoE: [`tests/pppoe-isp.sh`](src/octeon_flowtable/tests/pppoe-isp.sh) turns the
+bench host into a fake PPPoE ISP (rp-pppoe server in a netns on a VLAN of the
+bench NIC) and adds a matching `pppwan` interface on the DUT, so one cable
+carries both the LAN and the PPPoE-over-VLAN WAN. Incoming PPPoE frames are only
+fast-pathed for a session an offloaded flow is using (port + VLANs + session id
++ the concentrator's MAC — what the kernel's `pppoe_rcv` checks); refusals count
+in the `r_ppp` parameter, learned sessions in `pppoe_sessions`.
+[`tests/l2_xform_test.sh`](src/octeon_flowtable/tests/l2_xform_test.sh) is a
+host-side unit test of the L2 rewrite (every VLAN/QinQ/PPPoE encap/decap
+combination, byte-exact), extracted straight from the driver source.
+
 ## Status & caveats
 
 Tested on the [ERLite-3](https://openwrt.org/toh/ubiquiti/edgerouter_lite) / CN5020
@@ -108,7 +120,10 @@ CN50xx is a ~2008-era Octeon Plus part, long since discontinued; this exists
 because it's a tractable hardware-fast-path target on cheap silicon, not because
 the world needs another router stack. Hardware ceilings (PIP
 parses ≤ 2 VLAN tags; the flowtable offloads TCP/UDP/GRE only; v6 extension
-headers go slow-path) are documented in `docs/FUTURE-WORK.md`. VPN: transit
+headers go slow-path) are documented in `docs/FUTURE-WORK.md`. PPPoE: IPv4 is
+hardware-verified; IPv6-over-PPPoE is implemented but not yet bench-tested; the
+offload MTU is the port MTU minus 8 (1492), so a `pppoe` device configured
+lower than that is not honoured by the fast path. VPN: transit
 WireGuard/IPsec-NAT-T is already offloaded (it's UDP); VPN *termination* is crypto,
 a separate problem — see `docs/COP2-CRYPTO-SCOPING.md`.
 

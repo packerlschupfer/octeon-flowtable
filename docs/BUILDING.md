@@ -85,8 +85,9 @@ The image lands in `bin/targets/octeon/generic/`. Flash it per
 
 ## Optional: DPI and traffic analysis
 
-Not part of the release images. Both add load and record per-device traffic, so they are
-opt-in. See [flowclassd](../src/flowclassd/README.md) and
+The `dpi` release image already includes both, so you only need this to add them to your
+own build. Both add load and record per-device traffic, so `lean` and `router` leave them
+out. See [flowclassd](../src/flowclassd/README.md) and
 [trafficd](../src/trafficd/README.md), including its privacy note.
 
 ```sh

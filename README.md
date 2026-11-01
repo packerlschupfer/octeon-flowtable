@@ -36,8 +36,8 @@ throughput. See [`docs/PROJECT-OUTCOME.md`](docs/PROJECT-OUTCOME.md) and
 
 [flowclassd](src/flowclassd/README.md) names each flow's application with nDPI before it is
 offloaded, and [trafficd](src/trafficd/README.md) serves a page with traffic per client and
-application plus an internet uplink graph. Both are opt-in and built from source; see
-[BUILDING.md](docs/BUILDING.md).
+application plus an internet uplink graph. Both are opt-in: use the `dpi` release image, or
+add them to your own build with [BUILDING.md](docs/BUILDING.md).
 
 ## Layout
 
@@ -48,7 +48,7 @@ src/octeon_flowtable/tests/  regression suite + nft/topology rigs (see Testing)
 src/staging-patches/      the octeon_ethernet hook patch (adds the exported hooks)
 package/octeon-flowtable/ OpenWrt kmod package (init script + UCI config)
 src/flowclassd/, src/trafficd/, package/{flowclassd,trafficd}/, src/fw4-patches/
-           optional DPI + traffic analysis page (not in the release images)
+           optional DPI + traffic analysis page (in the `dpi` release image)
 prompts/   reproducible runbooks (build / deploy / EdgeOS→OpenWrt config migration)
 ```
 
@@ -74,10 +74,12 @@ from this repo (GitHub Actions → [`build-image.yml`](.github/workflows/build-i
 The kernel already carries the staging hook patch and the offload tuning
 (CVMSEG=2, `receive_group_order=1`); `kmod-octeon-flowtable` is preinstalled.
 
-Two variants are published (asset names prefixed `lean-` / `router-`):
+Three variants are published (asset names prefixed `lean-` / `router-` / `dpi-`):
 
 - **lean** — offload + `conntrack`/`tcpdump`; a clean base to add your own packages to.
 - **router** — lean + LuCI web UI + WireGuard, for a more turnkey home router.
+- **dpi** — router + flowclassd (application classification) + trafficd (traffic page at
+  `/traffic/`, no login: see the [privacy note](src/trafficd/README.md)).
 
 The build is fully pinned (OpenWrt main @ `84f4f77`, kernel 6.18.34, pinned
 `packages`/`luci` feeds) so a given tag reproduces byte-for-byte — see [`ci/`](ci/).

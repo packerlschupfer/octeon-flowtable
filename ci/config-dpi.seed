@@ -1,0 +1,32 @@
+# 'dpi' variant seed — the router variant plus application classification (flowclassd)
+# and the traffic page (trafficd). Costs about 1.3 ms of CPU per new flow; bulk traffic
+# stays offloaded. The workflow also adds the fw4 flow_offloading_gate patch for this
+# variant only. See src/flowclassd/README.md and src/trafficd/README.md (privacy note).
+
+# --- Target: EdgeRouter Lite only ---
+CONFIG_TARGET_octeon=y
+CONFIG_TARGET_octeon_generic=y
+CONFIG_TARGET_octeon_generic_DEVICE_ubnt_edgerouter-lite=y
+
+# --- Hardware flow offload ---
+CONFIG_PACKAGE_kmod-octeon-flowtable=y
+CONFIG_PACKAGE_kmod-nft-offload=y
+CONFIG_PACKAGE_kmod-nf-flow=y
+
+# --- Web UI (LuCI over https) ---
+CONFIG_PACKAGE_luci=y
+CONFIG_PACKAGE_luci-ssl=y
+
+# --- WireGuard VPN (transit WireGuard is itself offloaded — it's UDP) ---
+CONFIG_PACKAGE_kmod-wireguard=y
+CONFIG_PACKAGE_wireguard-tools=y
+CONFIG_PACKAGE_luci-proto-wireguard=y
+
+# --- Verify the offload is engaged ---
+CONFIG_PACKAGE_conntrack=y
+CONFIG_PACKAGE_kmod-nf-conntrack-netlink=y
+CONFIG_PACKAGE_tcpdump=y
+
+# --- Classification and traffic page ---
+CONFIG_PACKAGE_flowclassd=y
+CONFIG_PACKAGE_trafficd=y

@@ -21,11 +21,12 @@ that is what CI produces.
 | `feeds.conf` | pinned `packages` + `luci` feeds (the workflow appends a `src-link` to this repo) |
 | `config.seed` | **lean** variant — ERLite target + the offload + conntrack/tcpdump |
 | `config-router.seed` | **router** variant — lean + LuCI web UI + WireGuard (more turnkey) |
+| `config-dpi.seed` | **dpi** variant — router + flowclassd + trafficd (the workflow also adds the fw4 gate patch) |
 | `apply-target-tweaks.sh` | re-applies CVMSEG=2, drops `OCTEON_ILM`, adds the `receive_group_order=1` cmdline |
 
-The workflow builds both variants in parallel (a matrix) and publishes them in one
-release; image filenames are prefixed `lean-` / `router-` since both build the same
-device. Add a third `config-*.seed` + a matrix entry to ship another variant.
+The workflow builds all variants in parallel (a matrix) and publishes them in one
+release; image filenames are prefixed `lean-` / `router-` / `dpi-` since all build the same
+device. Add another `config-*.seed` + a matrix entry to ship another variant.
 
 The staging kernel patch itself lives at
 [`../src/staging-patches/120-octeon-flowtable-hooks.patch`](../src/staging-patches/);
@@ -50,7 +51,7 @@ fails loudly with a `.rej` if it doesn't).
 - `workflow_dispatch` → build only, upload artifacts (no release).
 
 A cold build (toolchain from source) is ~45–90 min on a GitHub-hosted runner; the
-two variants build on parallel runners. The `dl/` and toolchain caches make reruns
+the variants build on parallel runners. The `dl/` and toolchain caches make reruns
 much faster. Free for public repos.
 
 ## Reproduce locally

@@ -1,0 +1,2 @@
+# flowclassd / fw4 flow_offloading_gate match on `ct packets`
+net.netfilter.nf_conntrack_acct=1

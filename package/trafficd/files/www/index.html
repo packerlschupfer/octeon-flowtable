@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Traffic analysis</title>
+<style>
+/* Roles, light defaults (reference palette: slots 1+2 validated light & dark). */
+.viz-root {
+  color-scheme: light;
+  --page:        #f9f9f7;
+  --surface-1:   #fcfcfb;
+  --text-primary:#0b0b0b;
+  --text-secondary:#52514e;
+  --muted:       #898781;
+  --grid:        #e1e0d9;
+  --axis:        #c3c2b7;
+  --border:      rgba(11,11,11,0.10);
+  --wash:        rgba(11,11,11,0.04);
+  --series-down: #2a78d6;   /* slot 1: download */
+  --series-up:   #eb6834;   /* slot 2: upload */
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --page:#0d0d0d; --surface-1:#1a1a19; --text-primary:#f0efec; --text-secondary:#c3c2b7;
+    --muted:#898781; --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
+    --wash:rgba(255,255,255,0.05); --series-down:#3987e5; --series-up:#d95926;
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --page:#0d0d0d; --surface-1:#1a1a19; --text-primary:#f0efec; --text-secondary:#c3c2b7;
+  --muted:#898781; --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
+  --wash:rgba(255,255,255,0.05); --series-down:#3987e5; --series-up:#d95926;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+.viz-root {
+  min-height: 100vh; background: var(--page); color: var(--text-primary);
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; padding: 20px 24px 40px;
+}
+header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+h1 { font-size: 20px; font-weight: 600; margin: 0; }
+h2 { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
+.sub { color: var(--text-secondary); font-size: 13px; }
+.filters { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface-1); }
+.seg button { border: 0; background: none; color: var(--text-secondary); padding: 6px 14px; font: inherit; cursor: pointer; }
+.seg button:hover { background: var(--wash); }
+.seg button[aria-pressed="true"] { color: var(--text-primary); font-weight: 600; background: var(--wash); }
+select, .btn { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+.btn { cursor: pointer; color: var(--text-secondary); }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+.kpi .label { color: var(--text-secondary); font-size: 13px; }
+.kpi .value { font-size: 26px; font-weight: 600; margin-top: 2px; }
+.kpi .note { color: var(--muted); font-size: 12px; }
+.chart-card { margin-bottom: 16px; }
+.legend { display: flex; gap: 16px; color: var(--text-secondary); font-size: 13px; margin: 6px 0 4px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.key { display: inline-block; width: 14px; height: 2px; border-radius: 1px; }
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; height: 240px; }
+.tip { position: absolute; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 10px; font-size: 13px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); display: none; white-space: nowrap; }
+.tip .t { color: var(--text-secondary); margin-bottom: 4px; }
+.tip .row { display: flex; align-items: center; gap: 8px; }
+.tip .row b { font-variant-numeric: tabular-nums; }
+.tip .row span { color: var(--text-secondary); }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
+table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+td { padding: 7px 8px; border-bottom: 1px solid var(--grid); vertical-align: middle; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.bar { width: 34%; }
+tr.click { cursor: pointer; }
+tr.click:hover, tr.click:focus { background: var(--wash); outline: none; }
+tr.sel { background: var(--wash); }
+.name { font-weight: 500; }
+.dim { color: var(--muted); font-size: 12px; }
+.empty { color: var(--muted); padding: 24px 8px; text-align: center; }
+.stale { opacity: 0.55; transition: opacity .2s; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+<div class="viz-root">
+  <header>
+    <h1>Traffic analysis</h1>
+    <div class="seg" id="view" role="tablist" aria-label="View">
+      <button role="tab" data-v="clients">Clients &amp; applications</button>
+      <button role="tab" data-v="uplink">Internet uplink</button>
+    </div>
+    <span class="sub" id="status">loading…</span>
+  </header>
+
+  <div class="filters" role="toolbar" aria-label="Filters">
+    <div class="seg" id="win" role="group" aria-label="Time window">
+      <button data-w="1h">Last hour</button>
+      <button data-w="24h">24 hours</button>
+      <button data-w="7d">7 days</button>
+      <button data-w="30d">30 days</button>
+    </div>
+    <select id="client" aria-label="Client"><option value="">All clients</option></select>
+    <button class="btn" id="theme" title="Toggle light/dark">Theme</button>
+  </div>
+
+  <div id="body">
+  <div id="view-clients">
+    <section class="kpis">
+      <div class="card kpi"><div class="label">Download</div><div class="value" id="k-down">–</div><div class="note" id="k-down-n"></div></div>
+      <div class="card kpi"><div class="label">Upload</div><div class="value" id="k-up">–</div><div class="note" id="k-up-n"></div></div>
+      <div class="card kpi"><div class="label">Active clients</div><div class="value" id="k-cl">–</div><div class="note">with traffic in the window</div></div>
+      <div class="card kpi"><div class="label">Classified traffic</div><div class="value" id="k-cls">–</div><div class="note">bytes with a known application</div></div>
+    </section>
+
+    <section class="card chart-card">
+      <h2 id="chart-title">Throughput — all clients</h2>
+      <div class="legend" aria-hidden="true">
+        <span><i class="key" style="background:var(--series-down)"></i>Download</span>
+        <span><i class="key" style="background:var(--series-up)"></i>Upload</span>
+      </div>
+      <div class="chart" id="chart"><svg id="svg" role="img" aria-label="Throughput over time"></svg><div class="tip" id="tip"></div></div>
+    </section>
+
+    <div class="grid2">
+      <section class="card">
+        <h2>Clients</h2>
+        <div class="sub">Select a row to scope the page to that client</div>
+        <table id="t-clients"><thead><tr><th>Client</th><th class="num">Download</th><th class="num">Upload</th><th class="bar"><span class="sr">Share</span></th></tr></thead><tbody></tbody></table>
+      </section>
+      <section class="card">
+        <h2 id="apps-title">Applications</h2>
+        <div class="sub" id="apps-sub">All clients</div>
+        <table id="t-apps"><thead><tr><th>Application</th><th class="num">Download</th><th class="num">Upload</th><th class="bar"></th></tr></thead><tbody></tbody></table>
+      </section>
+    </div>
+  </div>
+
+  <div id="view-uplink" hidden>
+    <section class="kpis">
+      <div class="card kpi"><div class="label">Downloaded from the internet</div><div class="value" id="u-down">–</div><div class="note" id="u-down-n"></div></div>
+      <div class="card kpi"><div class="label">Uploaded to the internet</div><div class="value" id="u-up">–</div><div class="note" id="u-up-n"></div></div>
+      <div class="card kpi"><div class="label">Peak download</div><div class="value" id="u-pd">–</div><div class="note" id="u-pd-n"></div></div>
+      <div class="card kpi"><div class="label">Peak upload</div><div class="value" id="u-pu">–</div><div class="note" id="u-pu-n"></div></div>
+    </section>
+    <section class="card chart-card">
+      <h2>Internet uplink</h2>
+      <div class="sub" id="u-sub"></div>
+      <div class="legend" aria-hidden="true">
+        <span><i class="key" style="background:var(--series-down)"></i>Download</span>
+        <span><i class="key" style="background:var(--series-up)"></i>Upload</span>
+      </div>
+      <div class="chart" id="chart2"><svg id="svg2" role="img" aria-label="Internet uplink throughput over time"></svg><div class="tip" id="tip2"></div></div>
+      <div class="dim">Traffic between LAN clients (or the router) and the internet, including hardware-offloaded flows; excludes traffic between your own VLANs and the inside of VPN tunnels.</div>
+    </section>
+  </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+const $ = s => document.querySelector(s);
+const state = { win: localStorage.getItem('ta-win') || '24h', view: location.hash === '#uplink' ? 'uplink' : (localStorage.getItem('ta-view') || 'clients'), client: '', sum: null, ser: null };
+const WIN_SECS = { '1h': 3600, '24h': 86400, '7d': 7 * 86400, '30d': 30 * 86400 };
+
+const fmtBytes = b => {
+  const u = ['B', 'kB', 'MB', 'GB', 'TB'];
+  let i = 0; while (b >= 1000 && i < u.length - 1) { b /= 1000; i++; }
+  return (b >= 100 || i === 0 ? b.toFixed(0) : b.toFixed(1)) + ' ' + u[i];
+};
+const fmtRate = bps => {
+  const u = ['bit/s', 'kbit/s', 'Mbit/s', 'Gbit/s'];
+  let i = 0; while (bps >= 1000 && i < u.length - 1) { bps /= 1000; i++; }
+  return (bps >= 100 || i === 0 ? bps.toFixed(0) : bps.toFixed(1)) + ' ' + u[i];
+};
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const SVGNS = 'http://www.w3.org/2000/svg';
+const sv = (tag, attrs) => { const e = document.createElementNS(SVGNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+
+function clientLabel(i) {
+  const c = state.sum.clients[i];
+  if (!c) return '?';
+  if (!c.name) return c.ip || c.key;
+  /* identical gadgets can send the same hostname: tell them apart by MAC tail */
+  const twin = state.sum.clients.some((o, j) => j !== i && o.name === c.name);
+  return twin && c.key.includes(':') && !c.key.startsWith('ip:') ? `${c.name} (…${c.key.slice(-5)})` : c.name;
+}
+function appLabel(id) {
+  if (!id) return ['Unclassified', ''];
+  const a = state.sum.appnames[id];
+  return a ? a : ['#' + id, ''];
+}
+
+/* stacked bar: download | 2px gap | upload, 4px rounded data-end, square at the baseline */
+function stackBar(down, up, max) {
+  const W = 100, H = 10, gap = 2;
+  const svg = sv('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', width: '100%', height: H });
+  const total = down + up; if (!max || !total) return svg;
+  const wd = W * down / max, wu = W * up / max;
+  const end = (x, w, fill) => {           /* rect with rounded right end */
+    const r = Math.min(4, w / 2, H / 2);
+    return sv('path', { d: `M${x},0 H${x + w - r} Q${x + w},0 ${x + w},${r} V${H - r} Q${x + w},${H} ${x + w - r},${H} H${x} Z`, fill });
+  };
+  if (wu > 0.5) {
+    if (wd > 0.5) svg.appendChild(sv('rect', { x: 0, y: 0, width: Math.max(0, wd - gap / 2), height: H, fill: 'var(--series-down)' }));
+    svg.appendChild(end(wd > 0.5 ? wd + gap / 2 : 0, Math.max(1, wu - (wd > 0.5 ? gap / 2 : 0)), 'var(--series-up)'));
+  } else {
+    svg.appendChild(end(0, Math.max(1, wd), 'var(--series-down)'));
+  }
+  return svg;
+}
+
+function renderTables(win) {
+  const tb = $('#t-clients tbody'); tb.replaceChildren();
+  const rows = win.clients;
+  const max = rows.reduce((m, r) => Math.max(m, r.up + r.down), 0);
+  if (!rows.length) { const tr = el('tr'); const td = el('td', 'empty', 'No traffic in this window'); td.colSpan = 4; tr.appendChild(td); tb.appendChild(tr); }
+  for (const r of rows) {
+    const tr = el('tr', 'click' + (String(r.c) === state.client ? ' sel' : ''));
+    tr.tabIndex = 0;
+    const c = state.sum.clients[r.c];
+    const td0 = el('td'); td0.appendChild(el('div', 'name', clientLabel(r.c)));
+    td0.appendChild(el('div', 'dim', [c.ip, c.key.startsWith('ip:') ? '' : c.key].filter(Boolean).join(' · ')));
+    tr.append(td0, el('td', 'num', fmtBytes(r.down)), el('td', 'num', fmtBytes(r.up)));
+    const tdb = el('td', 'bar'); tdb.appendChild(stackBar(r.down, r.up, max)); tr.appendChild(tdb);
+    tr.title = `${clientLabel(r.c)}: ${fmtBytes(r.down)} down, ${fmtBytes(r.up)} up`;
+    const pick = () => { setClient(String(r.c) === state.client ? '' : String(r.c)); };
+    tr.addEventListener('click', pick);
+    tr.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+    tb.appendChild(tr);
+  }
+
+  /* applications: all clients, or the selected client's top apps */
+  let apps;
+  if (state.client) {
+    const r = rows.find(x => String(x.c) === state.client);
+    apps = r ? r.apps.map(([a, up, down]) => ({ a, up, down })) : [];
+    $('#apps-sub').textContent = `${clientLabel(+state.client)} — top ${apps.length} applications`;
+  } else {
+    apps = win.apps;
+    $('#apps-sub').textContent = 'All clients';
+  }
+  const ta = $('#t-apps tbody'); ta.replaceChildren();
+  const amax = apps.reduce((m, r) => Math.max(m, r.up + r.down), 0);
+  if (!apps.length) { const tr = el('tr'); const td = el('td', 'empty', 'No traffic in this window'); td.colSpan = 4; tr.appendChild(td); ta.appendChild(tr); }
+  for (const r of apps) {
+    const [name, cat] = appLabel(r.a);
+    const tr = el('tr');
+    const td0 = el('td'); td0.appendChild(el('div', 'name', name));
+    const meta = [cat, r.clients != null ? `${r.clients} client${r.clients === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ');
+    td0.appendChild(el('div', 'dim', meta));
+    tr.append(td0, el('td', 'num', fmtBytes(r.down)), el('td', 'num', fmtBytes(r.up)));
+    const tdb = el('td', 'bar'); tdb.appendChild(stackBar(r.down, r.up, amax)); tr.appendChild(tdb);
+    tr.title = `${name}: ${fmtBytes(r.down)} down, ${fmtBytes(r.up)} up`;
+    ta.appendChild(tr);
+  }
+}
+
+function renderKpis(win) {
+  let rows = win.clients;
+  if (state.client) rows = rows.filter(r => String(r.c) === state.client);
+  const down = rows.reduce((s, r) => s + r.down, 0), up = rows.reduce((s, r) => s + r.up, 0);
+  $('#k-down').textContent = fmtBytes(down);
+  $('#k-up').textContent = fmtBytes(up);
+  $('#k-down-n').textContent = 'avg ' + fmtRate(down * 8 / WIN_SECS[state.win]);
+  $('#k-up-n').textContent = 'avg ' + fmtRate(up * 8 / WIN_SECS[state.win]);
+  $('#k-cl').textContent = state.client ? '1' : String(win.clients.length);
+  let total = 0, unk = 0;
+  if (state.client) {
+    for (const r of rows) for (const [a, u, d] of r.apps) { total += u + d; if (!a) unk += u + d; }
+  } else {
+    for (const a of win.apps) { total += a.up + a.down; if (!a.a) unk += a.up + a.down; }
+  }
+  const pct = total ? 100 * (total - unk) / total : null;   /* never round a remainder up to 100 */
+  $('#k-cls').textContent = pct == null ? '–' : (pct === 100 ? '100' : pct >= 99 ? (Math.floor(pct * 10) / 10).toFixed(1) : Math.floor(pct)) + ' %';
+}
+
+/* line chart of download + upload rates (bit/s) with crosshair tooltip.
+ * pts: [{t, up, down}] in bit/s; step: seconds per point */
+function lineChart(svgSel, tipSel, boxSel, pts, step, fine) {
+  const svg = $(svgSel); svg.replaceChildren();
+  const W = svg.clientWidth || 800, H = 240, L = 64, R = 16, T = 10, B = 26;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const maxV = Math.max(1, ...pts.map(p => Math.max(p.up, p.down)));
+  const nice = v => { const e = Math.pow(10, Math.floor(Math.log10(v))); const f = v / e; return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * e; };
+  const top = nice(maxV);
+  const lead = top / Math.pow(10, Math.floor(Math.log10(top)));
+  const nT = lead === 5 || lead === 10 ? 5 : 4;   /* clean steps: 5->1, 10->2, 2->0.5, 1->0.25 */
+  const x = i => L + (W - L - R) * (pts.length > 1 ? i / (pts.length - 1) : 0.5);
+  const y = v => T + (H - T - B) * (1 - v / top);
+  for (let k = 0; k <= nT; k++) {         /* hairline grid + y ticks */
+    const v = top * k / nT;
+    svg.appendChild(sv('line', { x1: L, x2: W - R, y1: y(v), y2: y(v), stroke: k ? 'var(--grid)' : 'var(--axis)', 'stroke-width': 1 }));
+    const t = sv('text', { x: L - 8, y: y(v) + 4, 'text-anchor': 'end', 'font-size': 11, fill: 'var(--muted)' });
+    t.textContent = fmtRate(v); svg.appendChild(t);
+  }
+  const ticks = 6;
+  for (let k = 0; k <= ticks && pts.length; k++) {
+    const i = Math.round((pts.length - 1) * k / ticks), d = new Date(pts[i].t * 1000);
+    const t = sv('text', { x: x(i), y: H - 8, 'text-anchor': k === 0 ? 'start' : k === ticks ? 'end' : 'middle', 'font-size': 11, fill: 'var(--muted)' });
+    t.textContent = fine ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    svg.appendChild(t);
+  }
+  const line = (f, color) => {
+    if (!pts.length) return;
+    const d = pts.map((p, i) => (i ? 'L' : 'M') + x(i).toFixed(1) + ',' + y(f(p)).toFixed(1)).join('');
+    svg.appendChild(sv('path', { d: d + `L${x(pts.length - 1)},${y(0)}L${x(0)},${y(0)}Z`, fill: color, 'fill-opacity': 0.10, stroke: 'none' }));
+    svg.appendChild(sv('path', { d, fill: 'none', stroke: color, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+  };
+  line(p => p.down, 'var(--series-down)');
+  line(p => p.up, 'var(--series-up)');
+
+  const hair = sv('line', { y1: T, y2: H - B, stroke: 'var(--axis)', 'stroke-width': 1, visibility: 'hidden' });
+  const dotD = sv('circle', { r: 4, fill: 'var(--series-down)', stroke: 'var(--surface-1)', 'stroke-width': 2, visibility: 'hidden' });
+  const dotU = sv('circle', { r: 4, fill: 'var(--series-up)', stroke: 'var(--surface-1)', 'stroke-width': 2, visibility: 'hidden' });
+  svg.append(hair, dotD, dotU);
+  const hit = sv('rect', { x: L, y: T, width: W - L - R, height: H - T - B, fill: 'transparent' });
+  svg.appendChild(hit);
+  const tip = $(tipSel);
+  const show = i => {
+    const p = pts[i]; if (!p) return;
+    for (const e of [hair, dotD, dotU]) e.setAttribute('visibility', 'visible');
+    hair.setAttribute('x1', x(i)); hair.setAttribute('x2', x(i));
+    dotD.setAttribute('cx', x(i)); dotD.setAttribute('cy', y(p.down));
+    dotU.setAttribute('cx', x(i)); dotU.setAttribute('cy', y(p.up));
+    tip.replaceChildren();
+    const d = new Date(p.t * 1000), e = new Date((p.t + step) * 1000);
+    const o = { hour: '2-digit', minute: '2-digit' };
+    tip.appendChild(el('div', 't', (fine ? '' : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ') + d.toLocaleTimeString([], o) + '–' + e.toLocaleTimeString([], o)));
+    for (const [v, name, c] of [[p.down, 'Download', 'var(--series-down)'], [p.up, 'Upload', 'var(--series-up)']]) {
+      const r = el('div', 'row'); const k = el('i', 'key'); k.style.background = c;
+      r.append(k, el('b', null, fmtRate(v)), el('span', null, name)); tip.appendChild(r);
+    }
+    tip.style.display = 'block';
+    const box = $(boxSel).getBoundingClientRect(), px = x(i) * box.width / W;
+    tip.style.left = Math.min(Math.max(0, px + 12), box.width - tip.offsetWidth) + 'px';
+    tip.style.top = '8px';
+  };
+  const hide = () => { tip.style.display = 'none'; for (const e of [hair, dotD, dotU]) e.setAttribute('visibility', 'hidden'); };
+  hit.addEventListener('pointermove', ev => {
+    const r = svg.getBoundingClientRect(), mx = (ev.clientX - r.left) * W / r.width;
+    show(Math.max(0, Math.min(pts.length - 1, Math.round((mx - L) / (W - L - R) * (pts.length - 1)))));
+  });
+  hit.addEventListener('pointerleave', hide);
+}
+
+/* [up, down, ...] byte pairs -> rate points for the window */
+function toPoints(arr, start, step, secs) {
+  const n = arr.length / 2, want = Math.min(n, Math.round(secs / step)), pts = [];
+  for (let i = n - want; i < n; i++) pts.push({ t: start + i * step, up: arr[2 * i] * 8 / step, down: arr[2 * i + 1] * 8 / step });
+  return pts;
+}
+
+/* clients view: throughput of all clients or the selected one (5-min / hourly) */
+function renderChart() {
+  const ser = state.ser; if (!ser) return;
+  const fine = state.win === '1h' || state.win === '24h';
+  const src = fine ? ser.min : ser.hour;
+  const pts = toPoints(src.series[state.client || 'all'] || [], src.start, src.step, WIN_SECS[state.win]);
+  $('#chart-title').textContent = 'Throughput — ' + (state.client ? clientLabel(+state.client) : 'all clients');
+  lineChart('#svg', '#tip', '#chart', pts, src.step, fine);
+}
+
+/* uplink view: internet traffic at 1-minute (1h/24h) or hourly (7d/30d) resolution */
+function renderUplink() {
+  const w = state.ser && state.ser.wan; if (!w) return;
+  const fine = state.win === '1h' || state.win === '24h';
+  const src = fine ? w.min : w.hour;
+  const pts = toPoints(src.data, src.start, src.step, WIN_SECS[state.win]);
+  let up = 0, down = 0, pu = null, pd = null;
+  for (const p of pts) {
+    up += p.up * src.step / 8; down += p.down * src.step / 8;
+    if (!pd || p.down > pd.down) pd = p;
+    if (!pu || p.up > pu.up) pu = p;
+  }
+  const res = fine ? '1-minute' : 'hourly';
+  const when = p => p ? new Date(p.t * 1000).toLocaleString([], fine ? { hour: '2-digit', minute: '2-digit' } : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+  $('#u-down').textContent = fmtBytes(down);
+  $('#u-up').textContent = fmtBytes(up);
+  $('#u-down-n').textContent = 'avg ' + fmtRate(down * 8 / WIN_SECS[state.win]);
+  $('#u-up-n').textContent = 'avg ' + fmtRate(up * 8 / WIN_SECS[state.win]);
+  $('#u-pd').textContent = pd ? fmtRate(pd.down) : '–';
+  $('#u-pu').textContent = pu ? fmtRate(pu.up) : '–';
+  $('#u-pd-n').textContent = pd && pd.down ? `${res} average, at ${when(pd)}` : `${res} average`;
+  $('#u-pu-n').textContent = pu && pu.up ? `${res} average, at ${when(pu)}` : `${res} average`;
+  $('#u-sub').textContent = `Download and upload rate, ${res} resolution`;
+  lineChart('#svg2', '#tip2', '#chart2', pts, src.step, fine);
+}
+
+function render() {
+  if (!state.sum) return;
+  const win = state.sum.windows[state.win];
+  for (const b of document.querySelectorAll('#win button')) b.setAttribute('aria-pressed', b.dataset.w === state.win);
+  for (const b of document.querySelectorAll('#view button')) b.setAttribute('aria-pressed', b.dataset.v === state.view);
+  $('#view-clients').hidden = state.view !== 'clients';
+  $('#view-uplink').hidden = state.view !== 'uplink';
+  $('#client').hidden = state.view !== 'clients';
+  if (state.view === 'uplink') {
+    renderUplink();
+    const g = new Date(state.sum.generated * 1000);
+    $('#status').textContent = `updated ${g.toLocaleTimeString()} · refreshes every minute`;
+    return;
+  }
+  /* client selector lists clients with traffic in this window */
+  const sel = $('#client'); const keep = state.client; sel.replaceChildren(new Option('All clients', ''));
+  for (const r of win.clients) sel.appendChild(new Option(clientLabel(r.c), String(r.c)));
+  if (keep && !win.clients.some(r => String(r.c) === keep)) sel.appendChild(new Option(clientLabel(+keep), keep));
+  sel.value = keep;
+  renderKpis(win); renderTables(win); renderChart();
+  const g = new Date(state.sum.generated * 1000);
+  $('#status').textContent = `updated ${g.toLocaleTimeString()} · refreshes every minute`;
+}
+
+function setClient(c) { state.client = c; render(); }
+
+async function load() {
+  $('#body').classList.add('stale');            /* refetch keeps the frame */
+  try {
+    const [s, r] = await Promise.all(['data/summary.json', 'data/series.json'].map(u => fetch(u, { cache: 'no-store' }).then(x => { if (!x.ok) throw new Error(u + ': ' + x.status); return x.json(); })));
+    state.sum = s; state.ser = r; render();
+  } catch (e) {
+    $('#status').textContent = 'no data yet (' + e.message + ')';
+  }
+  $('#body').classList.remove('stale');
+}
+
+for (const b of document.querySelectorAll('#win button'))
+  b.addEventListener('click', () => { state.win = b.dataset.w; localStorage.setItem('ta-win', state.win); render(); });
+$('#client').addEventListener('change', e => setClient(e.target.value));
+for (const b of document.querySelectorAll('#view button'))
+  b.addEventListener('click', () => { state.view = b.dataset.v; localStorage.setItem('ta-view', state.view); history.replaceState(null, '', state.view === 'uplink' ? '#uplink' : '#'); render(); });
+$('#theme').addEventListener('click', () => {
+  const cur = document.documentElement.dataset.theme ||
+    (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  document.documentElement.dataset.theme = cur === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('ta-theme', document.documentElement.dataset.theme); render();
+});
+if (localStorage.getItem('ta-theme')) document.documentElement.dataset.theme = localStorage.getItem('ta-theme');
+addEventListener('resize', () => render());
+load(); setInterval(load, 60000);
+</script>
+</body>
+</html>

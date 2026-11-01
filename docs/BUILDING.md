@@ -83,6 +83,28 @@ make package/octeon-flowtable/compile
 The image lands in `bin/targets/octeon/generic/`. Flash it per
 [INSTALLING.md](INSTALLING.md).
 
+## Optional: DPI and traffic analysis
+
+Not part of the release images. Both add load and record per-device traffic, so they are
+opt-in. See [flowclassd](../src/flowclassd/README.md) and
+[trafficd](../src/trafficd/README.md), including its privacy note.
+
+```sh
+cp -r <repo>/package/flowclassd <repo>/package/trafficd <openwrt>/package/
+mkdir -p <openwrt>/package/network/config/firewall4/patches
+cp <repo>/src/fw4-patches/100-flow-offloading-gate.patch \
+   <openwrt>/package/network/config/firewall4/patches/
+make menuconfig    # Network → <*> flowclassd, <*> trafficd
+```
+
+The packages locate their source relative to themselves (`../../src/...`), so also link
+the sources: `ln -s <repo>/src <openwrt>/src`.
+
+The fw4 patch adds `flow_offloading_gate`, which holds a flow back from offload until it is
+classified, or for 24 packets at most; without it, flows offload before nDPI sees their
+payload. It is inert until that option is set, which the flowclassd package does on install.
+If flowclassd stops, traffic keeps flowing and offloading, just unclassified.
+
 ### Building the module standalone (without a full image)
 
 ```sh

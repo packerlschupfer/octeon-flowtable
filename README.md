@@ -32,6 +32,13 @@ and a **PKO tail-drop AQM** that cuts bufferbloat 54 ms → 4 ms at equal
 throughput. See [`docs/PROJECT-OUTCOME.md`](docs/PROJECT-OUTCOME.md) and
 [`docs/FUTURE-WORK.md`](docs/FUTURE-WORK.md) for the full matrix.
 
+## Optional: DPI and traffic analysis
+
+[flowclassd](src/flowclassd/README.md) names each flow's application with nDPI before it is
+offloaded, and [trafficd](src/trafficd/README.md) serves a page with traffic per client and
+application plus an internet uplink graph. Both are opt-in and built from source; see
+[BUILDING.md](docs/BUILDING.md).
+
 ## Layout
 
 ```
@@ -40,6 +47,8 @@ src/octeon_flowtable/     the kernel module
 src/octeon_flowtable/tests/  regression suite + nft/topology rigs (see Testing)
 src/staging-patches/      the octeon_ethernet hook patch (adds the exported hooks)
 package/octeon-flowtable/ OpenWrt kmod package (init script + UCI config)
+src/flowclassd/, src/trafficd/, package/{flowclassd,trafficd}/, src/fw4-patches/
+           optional DPI + traffic analysis page (not in the release images)
 prompts/   reproducible runbooks (build / deploy / EdgeOS→OpenWrt config migration)
 ```
 
@@ -140,4 +149,5 @@ No pressure either way — issues and PRs are equally welcome. There's also a
 
 ## License
 
-GPL-2.0 (it's a Linux kernel module). See [`LICENSE`](LICENSE).
+GPL-2.0 (it's a Linux kernel module). See [`LICENSE`](LICENSE). The optional flowclassd
+is GPL-2.0-or-later, because it links libndpi (LGPL-3.0-or-later).

@@ -172,6 +172,17 @@ bypass) but stays visible in `conntrack -L` with live byte counts (per-flow
 software stats fed back through the flowtable stats callback). That tcpdump-blind /
 conntrack-visible combination is the signal that the fast path is actually firing.
 
+### With confsh
+
+If you use [confsh](https://github.com/halcycon/confsh) (optional, installed separately),
+`show offload` prints the module counters and a health verdict. Images built after
+v0.2.0 include the plugin, and it does nothing without confsh. On v0.2.0, copy
+[`package/octeon-flowtable/files/confsh-op-show-offload`](../package/octeon-flowtable/files/confsh-op-show-offload)
+to `/usr/libexec/confsh/op/show/offload` and make it executable.
+
+`settling` right after boot or a firewall reload is normal: the reload orphans live
+entries, and the GC clears them within minutes.
+
 ## What's accelerated
 
 IPv4 + IPv6, NAT + routing, untagged + single-VLAN (retag/pop/push) + QinQ

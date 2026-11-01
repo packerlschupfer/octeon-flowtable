@@ -1,0 +1,9 @@
+#!/bin/sh
+# Gate fw4's flow offload on classification (needs the fw4
+# 100-flow-offloading-gate patch). Respect an explicit admin setting.
+[ -n "$(uci -q get firewall.@defaults[0].flow_offloading_gate)" ] && exit 0
+uci -q batch <<EOF
+set firewall.@defaults[0].flow_offloading_gate='1'
+commit firewall
+EOF
+exit 0

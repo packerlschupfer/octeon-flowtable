@@ -1,0 +1,30 @@
+#!/bin/sh /etc/rc.common
+# Traffic analysis collector. Output: /tmp/trafficd/*.json (served at
+# /traffic/ by uhttpd); history: /etc/trafficd/history.bin (kept on
+# sysupgrade via /lib/upgrade/keep.d/trafficd).
+
+START=96
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	config_load trafficd
+	local enabled interval wan
+	config_get_bool enabled settings enabled 1
+	[ "$enabled" = 1 ] || return 0
+	config_get interval settings interval 30
+	config_get wan settings wan_device ""
+	[ -n "$wan" ] || wan=$(uci -q get network.wan.device)
+	[ -n "$wan" ] || wan=eth0
+
+	mkdir -p /etc/trafficd /tmp/trafficd
+	procd_open_instance
+	procd_set_param command /usr/sbin/trafficd -i "$interval" -w "$wan" \
+		-o /tmp/trafficd -s /etc/trafficd/history.bin
+	procd_set_param respawn 3600 5 5
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger trafficd
+}

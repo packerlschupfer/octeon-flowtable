@@ -79,15 +79,26 @@ With a serial console (**115200 8N1**) and a TFTP server on your PC, interrupt
 U-Boot at power-on and RAM-boot the initramfs kernel:
 
 ```
+setenv ipaddr <a-free-ip>
 setenv serverip <your-PC-ip>
 tftpboot $loadaddr <variant>-…-initramfs-kernel.bin
-bootoctlinux $loadaddr numcores=2
+bootoctlinux $loadaddr coremask=0x3
 ```
 
 Nothing is written to the stick, so this both lets you try the image and recovers a
 box with a bad on-disk image. (`initramfs-kernel.bin` is self-contained; no md5
-file involved.) If U-Boot networking is uncooperative, re-imaging the stick on a PC
-(method B) is the reliable fallback — the ERLite can't be permanently bricked this
+file involved.) U-Boot networking can be uncooperative: on one of our units it put nothing on the
+wire on any port. The kernel can then be RAM-booted from the stick instead: copy it to
+the FAT partition as `x.bin`, next to an `x.bin.md5` (same format as `vmlinux.64.md5`;
+U-Boot reads it), then
+
+```
+usb reset
+fatload usb 0 $loadaddr x.bin
+bootoctlinux $loadaddr coremask=0x3
+```
+
+Otherwise re-imaging the stick on a PC (method B) is the reliable fallback — the ERLite can't be permanently bricked this
 way. For the canonical per-board U-Boot procedure see the
 [OpenWrt EdgeRouter Lite device page](https://openwrt.org/toh/ubiquiti/edgerouter.lite).
 
@@ -149,7 +160,7 @@ ssh root@<box> 'service octeon-flowtable restart'
 ```sh
 # drive a forwarded TCP/UDP flow LAN→WAN (e.g. iperf3 from a LAN host to a WAN host)
 ssh root@<box> '
-  conntrack -L 2>/dev/null | grep -c HW_OFFLOAD                # offloaded flows
+  grep -c HW_OFFLOAD /proc/net/nf_conntrack                    # offloaded flows
   grep Ethernet /proc/interrupts                                # one group IRQ per CPU
   cat /sys/module/octeon_flowtable/parameters/hw_tx_bytes 2>/dev/null   # if fau_stats=1
   cat /sys/module/octeon_flowtable/parameters/aqm_drops 2>/dev/null     # if aqm_limit>0

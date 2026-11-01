@@ -51,7 +51,7 @@ prompts/   reproducible runbooks (build / deploy / EdgeOS→OpenWrt config migra
    (or select **kmod-octeon-flowtable** from `package/` in menuconfig).
 3. Enable hardware offload in `/etc/config/firewall`:
    `option flow_offloading '1'` + `option flow_offloading_hw '1'`, then `fw4 reload`.
-4. Verify: `conntrack -L | grep HW_OFFLOAD`.
+4. Verify: `grep HW_OFFLOAD /proc/net/nf_conntrack`.
 
 Building from source: [`docs/BUILDING.md`](docs/BUILDING.md). Installing,
 enabling, and tuning: [`docs/INSTALLING.md`](docs/INSTALLING.md). Reproducible

@@ -46,7 +46,7 @@ config octeon-flowtable 'settings'
 ```sh
 # drive a forwarded TCP/UDP flow LAN->WAN (e.g. iperf3 from a LAN host to a WAN host)
 ssh root@<box> '
-  conntrack -L 2>/dev/null | grep -c HW_OFFLOAD          # offloaded flows
+  grep -c HW_OFFLOAD /proc/net/nf_conntrack              # offloaded flows
   grep Ethernet /proc/interrupts                          # one group IRQ per CPU
   cat /sys/module/octeon_flowtable/parameters/aqm_drops   # if aqm_limit>0
 '

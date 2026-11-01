@@ -51,11 +51,12 @@ define Build/Compile
 	+$(KERNEL_MAKE) $(PKG_JOBS) M="$(PKG_BUILD_DIR)" modules
 endef
 
-# install the procd init script + default UCI config
+# install the procd init script + default UCI config + confsh op-mode plugin
 define KernelPackage/octeon-flowtable/install
-	$(INSTALL_DIR) $(1)/etc/init.d $(1)/etc/config
+	$(INSTALL_DIR) $(1)/etc/init.d $(1)/etc/config $(1)/usr/libexec/confsh/op/show
 	$(INSTALL_BIN) ./files/octeon-flowtable.init $(1)/etc/init.d/octeon-flowtable
 	$(INSTALL_CONF) ./files/octeon-flowtable.config $(1)/etc/config/octeon-flowtable
+	$(INSTALL_BIN) ./files/confsh-op-show-offload $(1)/usr/libexec/confsh/op/show/offload
 endef
 
 $(eval $(call KernelPackage,octeon-flowtable))

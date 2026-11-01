@@ -1,0 +1,51 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# confsh op-mode plugin: "show offload" — octeon_flowtable HW offload status.
+#
+# Installed to /usr/libexec/confsh/op/show/offload. confsh picks it up if
+# present; neither package depends on the other (see confsh docs/DESIGN.md).
+
+P=/sys/module/octeon_flowtable/parameters
+
+if [ ! -d "$P" ]; then
+	echo "octeon_flowtable is not loaded" >&2
+	exit 1
+fi
+
+flows=$(cat "$P/flows" 2>/dev/null)
+txfail=$(cat "$P/tx_fail" 2>/dev/null)
+aqm=$(cat "$P/aqm_drops" 2>/dev/null)
+hw=0
+[ -r /proc/net/nf_conntrack ] && hw=$(grep -c HW_OFFLOAD /proc/net/nf_conntrack)
+
+echo "Octeon flow offload"
+printf '  %-16s %s\n' "flows installed:" "${flows:-?}"
+printf '  %-16s %s\n' "conntrack HW:"    "$hw"
+printf '  %-16s %s\n' "tx_fail:"         "${txfail:-?}"
+printf '  %-16s %s\n' "aqm_drops:"       "${aqm:-?}"
+
+# remaining module parameters, for completeness
+for f in "$P"/*; do
+	n=${f##*/}
+	case "$n" in flows|tx_fail|aqm_drops) continue ;; esac
+	[ -r "$f" ] || continue
+	printf '  %-16s %s\n' "$n:" "$(cat "$f" 2>/dev/null)"
+done
+
+# health: two unidirectional entries per offloaded conn, no tx failures. Each fw4
+# reload orphans live entries, which the GC clears within minutes, so a high
+# ratio right after boot or a reload is expected rather than a fault.
+if [ -n "$flows" ]; then
+	if [ "${txfail:-0}" != 0 ]; then
+		status="CHECK (tx_fail=$txfail since module load)"
+	elif [ "$flows" -eq 0 ] && [ "$hw" -eq 0 ]; then
+		status="idle (no offloaded flows)"
+	elif [ "$flows" -gt $((hw * 3 + 8)) ]; then
+		status="settling (flows > 2x HW=$hw; if it persists for 10+ min, check)"
+	elif [ $((flows + 8)) -lt "$hw" ]; then
+		status="CHECK (flows below HW=$hw)"
+	else
+		status="healthy (flows ~= 2x HW, tx_fail=0)"
+	fi
+	printf '  %-16s %s\n' "status:" "$status"
+fi

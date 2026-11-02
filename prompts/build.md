@@ -27,7 +27,7 @@ put it in the `bootcmd`.
 ## 2. Apply the staging hook patch
 
 ```sh
-cp src/staging-patches/120-octeon-flowtable-hooks.patch \
+cp src/staging-patches/120-octeon-flowtable-hooks.patch src/kernel-patches/*.patch \
    <openwrt>/target/linux/octeon/patches-6.18/
 # verify it applies clean (optional):
 #   tar xf dl/linux-6.18.34.tar.xz && cd linux-6.18.34 && \

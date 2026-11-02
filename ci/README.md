@@ -30,7 +30,9 @@ device. Add another `config-*.seed` + a matrix entry to ship another variant.
 
 The staging kernel patch itself lives at
 [`../src/staging-patches/120-octeon-flowtable-hooks.patch`](../src/staging-patches/);
-the workflow copies it into `target/linux/octeon/patches-6.18/` before building.
+the workflow copies it into `target/linux/octeon/patches-6.18/` before building, along
+with the security backports in [`../src/kernel-patches/`](../src/kernel-patches/). The
+pinned kernel gets no stable updates by itself, so add a backport there when a fix matters.
 
 ## Pinning / reproducibility
 
@@ -64,6 +66,7 @@ echo "src-link flowoffload /path/to/octeon-flowtable/package" >> feeds.conf
 ./scripts/feeds update -a && ./scripts/feeds install -a -p flowoffload
 ./scripts/feeds install kmod-octeon-flowtable conntrack tcpdump
 cp /path/to/octeon-flowtable/src/staging-patches/120-octeon-flowtable-hooks.patch \
+   /path/to/octeon-flowtable/src/kernel-patches/*.patch \
    target/linux/octeon/patches-6.18/
 sh /path/to/octeon-flowtable/ci/apply-target-tweaks.sh "$PWD"
 cp /path/to/octeon-flowtable/ci/config.seed .config && make defconfig   # or config-router.seed

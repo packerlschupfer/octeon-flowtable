@@ -49,5 +49,5 @@ NFQUEUE trip ~100-270 µs per queued packet. Bulk traffic is unaffected once off
 every new flow costs roughly 1.3 ms, so the ceiling is about 1,500 new flows/s. A home
 network typically sits far below that.
 
-Not in the release images: build it yourself (docs/BUILDING.md). flowclassd is
+Included in the `dpi` release image, or build it yourself (docs/BUILDING.md). flowclassd is
 GPL-2.0-or-later because it links libndpi (LGPL-3.0-or-later).

@@ -6,10 +6,12 @@ Getting the offload onto the box and turning it on.
 
 Grab a prebuilt image from the [**Releases**](../../releases) page (built by CI —
 the kernel already carries the staging hook patch and `kmod-octeon-flowtable` is
-baked in). Two variants:
+baked in). Three variants:
 
 - **`lean-…`** — offload + `conntrack`/`tcpdump`; a clean base to add packages to.
 - **`router-…`** — lean + LuCI web UI + WireGuard, for a turnkey home router.
+- **`dpi-…`** — router + flowclassd (application classification) + trafficd (traffic page at
+  `/traffic/`, no login: see the [privacy note](../src/trafficd/README.md)).
 
 Each variant ships two files (plus a `.manifest` and `sha256sums-*.txt` — verify
 those first):

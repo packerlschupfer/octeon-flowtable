@@ -34,6 +34,7 @@ The offload needs a few exported hooks added to the in-tree (built-in)
 
 ```sh
 cp <repo>/src/staging-patches/120-octeon-flowtable-hooks.patch \
+   <repo>/src/kernel-patches/*.patch \
    <openwrt>/target/linux/octeon/patches-6.18/
 ```
 

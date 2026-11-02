@@ -137,6 +137,9 @@ struct pfx {
 static struct pfx lan[MAX_PFX];
 static int nlan;
 static struct pfx local[MAX_PFX];	/* the router's own addresses (/32, /128) */
+#define MAX_EXCLUDE	16
+static struct pfx excl[MAX_EXCLUDE];	/* -x: LAN hosts never tracked per client */
+static int nexcl;
 static int nlocal;
 static struct pfx tun[MAX_PFX];		/* VPN (wg*) prefixes: inner traffic */
 static int ntun;
@@ -253,6 +256,38 @@ static int in_list(const struct pfx *l, int n, int fam, const uint8_t *a)
 	for (int i = 0; i < n; i++)
 		if (pfx_match(&l[i], fam, a))
 			return 1;
+	return 0;
+}
+
+/* "192.168.24.0/24" or "2001:db8::/64"; no length means a single host */
+static int parse_cidr(const char *s, struct pfx *p)
+{
+	char buf[INET6_ADDRSTRLEN + 4], *slash, *end;
+	int max;
+	long len;
+
+	if (snprintf(buf, sizeof(buf), "%s", s) >= (int)sizeof(buf))
+		return -1;
+	slash = strchr(buf, '/');
+	if (slash)
+		*slash = 0;
+	if (inet_pton(AF_INET, buf, p->a) == 1) {
+		p->fam = AF_INET;
+		max = 32;
+	} else if (inet_pton(AF_INET6, buf, p->a) == 1) {
+		p->fam = AF_INET6;
+		max = 128;
+	} else {
+		return -1;
+	}
+	if (!slash) {
+		p->len = max;
+		return 0;
+	}
+	len = strtol(slash + 1, &end, 10);
+	if (end == slash + 1 || *end || len < 0 || len > max)
+		return -1;
+	p->len = len;
 	return 0;
 }
 
@@ -597,6 +632,8 @@ static void credit(time_t now, int client, int app, uint64_t up, uint64_t down, 
 		wan_add(wan_min, MIN_KEEP, m, up, down);
 		wan_add(wan_hour, HOUR_KEEP, h, up, down);
 	}
+	if (client < 0)
+		return;		/* excluded host: uplink total only */
 	if (m != cur_min_t) {
 		acc_flush(cur_min, &mins, cur_min_t);
 		cur_min_t = m;
@@ -722,7 +759,12 @@ static void handle_ct(const struct nf_conntrack *ct, int destroyed)
 			s->rb = rb;
 		}
 	}
-	client = router ? router_client(now) : client_for(ip, now);
+	if (router)
+		client = router_client(now);
+	else if (in_list(excl, nexcl, fam, orig_is_client ? osrc : rsrc))
+		client = -1;	/* no client entry, name lookup or per-app record */
+	else
+		client = client_for(ip, now);
 	if (priming && !destroyed)
 		return;
 	if (orig_is_client)
@@ -1165,15 +1207,26 @@ int main(int argc, char **argv)
 	uint32_t family = AF_UNSPEC;
 	int opt, evfd;
 
-	while ((opt = getopt(argc, argv, "i:o:s:w:v")) != -1) {
+	while ((opt = getopt(argc, argv, "i:o:s:w:x:v")) != -1) {
 		switch (opt) {
 		case 'i': interval = atoi(optarg) > 5 ? atoi(optarg) : 5; break;
 		case 'o': out_dir = optarg; break;
 		case 's': state_file = optarg; break;
 		case 'w': wan_dev = optarg; break;
+		case 'x':
+			if (nexcl == MAX_EXCLUDE || parse_cidr(optarg, &excl[nexcl])) {
+				/* refuse to run: silently tracking a host the admin
+				 * meant to exclude is the worse failure */
+				fprintf(stderr, "trafficd: bad or too many -x: %s\n", optarg);
+				openlog("trafficd", LOG_PID, LOG_DAEMON);
+				logmsg(LOG_ERR, "bad or too many exclude: %s", optarg);
+				return 2;
+			}
+			nexcl++;
+			break;
 		case 'v': verbose = 1; break;
 		default:
-			fprintf(stderr, "usage: trafficd [-i secs] [-o outdir] [-s statefile] [-w wandev] [-v]\n");
+			fprintf(stderr, "usage: trafficd [-i secs] [-o outdir] [-s statefile] [-w wandev] [-x cidr]... [-v]\n");
 			return 2;
 		}
 	}
@@ -1197,7 +1250,8 @@ int main(int argc, char **argv)
 	nfct_callback_register(ev_h, NFCT_T_DESTROY, event_cb, NULL);
 	evfd = nfct_fd(ev_h);
 	fcntl(evfd, F_SETFL, fcntl(evfd, F_GETFL) | O_NONBLOCK);
-	logmsg(LOG_INFO, "started: interval %ds, wan %s, state %s", interval, wan_dev, state_file);
+	logmsg(LOG_INFO, "started: interval %ds, wan %s, state %s, %d excluded subnets",
+	       interval, wan_dev, state_file, nexcl);
 
 	while (!stop) {
 		time_t now = time(NULL);

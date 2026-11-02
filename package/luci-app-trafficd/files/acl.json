@@ -1,0 +1,6 @@
+{
+	"luci-app-trafficd": {
+		"description": "View the trafficd traffic page",
+		"read": {}
+	}
+}

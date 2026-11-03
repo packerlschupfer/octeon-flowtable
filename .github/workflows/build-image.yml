@@ -75,7 +75,7 @@ jobs:
           # Make every package any variant might select available; defconfig picks per seed.
           ./scripts/feeds install kmod-octeon-flowtable conntrack tcpdump \
             luci luci-ssl luci-proto-wireguard wireguard-tools \
-            flowclassd trafficd
+            flowclassd trafficd luci-app-trafficd
 
       - name: Drop in the staging hook patch + target tweaks
         working-directory: openwrt
@@ -107,6 +107,7 @@ jobs:
             || { echo "kmod-octeon-flowtable not selected — feed/package problem"; exit 1; }
           if [ "${{ matrix.variant }}" = dpi ]; then
             grep -q '^CONFIG_PACKAGE_flowclassd=y' .config && grep -q '^CONFIG_PACKAGE_trafficd=y' .config \
+              && grep -q '^CONFIG_PACKAGE_luci-app-trafficd=y' .config \
               || { echo "flowclassd/trafficd not selected — feed/package problem"; exit 1; }
           fi
 

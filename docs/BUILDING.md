@@ -92,11 +92,12 @@ out. See [flowclassd](../src/flowclassd/README.md) and
 [trafficd](../src/trafficd/README.md), including its privacy note.
 
 ```sh
-cp -r <repo>/package/flowclassd <repo>/package/trafficd <openwrt>/package/
+cp -r <repo>/package/flowclassd <repo>/package/trafficd <repo>/package/luci-app-trafficd \
+   <openwrt>/package/
 mkdir -p <openwrt>/package/network/config/firewall4/patches
 cp <repo>/src/fw4-patches/100-flow-offloading-gate.patch \
    <openwrt>/package/network/config/firewall4/patches/
-make menuconfig    # Network → <*> flowclassd, <*> trafficd
+make menuconfig    # Network → <*> flowclassd, <*> trafficd; optional LuCI → Applications → luci-app-trafficd
 ```
 
 The packages locate their source relative to themselves (`../../src/...`), so also link

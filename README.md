@@ -48,7 +48,7 @@ src/octeon_flowtable/tests/  regression suite + nft/topology rigs (see Testing)
 src/staging-patches/      the octeon_ethernet hook patch (adds the exported hooks)
 src/kernel-patches/       security backports for the pinned 6.18.34 kernel
 package/octeon-flowtable/ OpenWrt kmod package (init script + UCI config)
-src/flowclassd/, src/trafficd/, package/{flowclassd,trafficd}/, src/fw4-patches/
+src/flowclassd/, src/trafficd/, package/{flowclassd,trafficd,luci-app-trafficd}/, src/fw4-patches/
            optional DPI + traffic analysis page (in the `dpi` release image)
 prompts/   reproducible runbooks (build / deploy / EdgeOS→OpenWrt config migration)
 ```

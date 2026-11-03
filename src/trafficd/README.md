@@ -35,6 +35,27 @@ uci commit uhttpd; /etc/init.d/uhttpd restart
 
 Also consider whether the people on your network know their traffic is being recorded.
 
+## Excluding a subnet
+
+To keep hosts off the page entirely, list them in `/etc/config/trafficd` (repeatable, IPv4
+or IPv6, a bare address means one host), then `/etc/init.d/trafficd restart`:
+
+```
+config trafficd 'settings'
+	list exclude '192.168.24.0/24'
+```
+
+Excluded hosts get no client entry, name lookup or per-application record. Their bytes still
+count in the internet uplink total, so that graph stays correct. Existing history for them
+remains until it ages out (up to 31 days), or delete `/etc/trafficd/history.bin`. A malformed
+value stops the daemon with an error instead of tracking the host anyway. Clients are tracked
+by MAC, so a device that also has an address outside the exclusion still shows under that one.
+
+## LuCI
+
+`luci-app-trafficd` adds **Status > Traffic** to LuCI and shows this page. It is a link, not
+access control: `/traffic/` itself still has no login. The `dpi` release image includes it.
+
 ## Limits
 
 - A connection's first bytes can land in "Unclassified" if a dump catches it before

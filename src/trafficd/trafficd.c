@@ -464,6 +464,7 @@ static void load_names(void)
 			char *save = NULL, *id = NULL, *kind = NULL,
 				*host = NULL, *expiry = NULL, *end = NULL, *tok = NULL;
 			long long valid = -1;
+			const char *m = NULL;
 
 			if (strncmp(l, "# ", 2) || !strtok_r(l + 2, skip, &save))
 				continue;
@@ -487,14 +488,10 @@ static void load_names(void)
 			if (!strtok_r(NULL, skip, &save) ||
 				!(tok = strtok_r(NULL, skip, &save)) || strcmp(tok, "128"))
 				continue;
-			if (duid_mac(id, mac)) {
-				hn_set(mac, host);
-				continue;
-			}
+			/* Prefer the currently active NIC. */
 			while ((tok = strtok_r(NULL, skip, &save))) {
 				struct in6_addr address6 = {};
-				const char *m = NULL;
-				char* slash = strrchr(tok, '/');
+				char *slash = strrchr(tok, '/');
 
 				if (!slash || strcmp(slash + 1, "128"))
 					continue;
@@ -504,6 +501,8 @@ static void load_names(void)
 					break;
 				}
 			}
+			if (!m && duid_mac(id, mac))
+				hn_set(mac, host);
 		}
 		fclose(f);
 	}

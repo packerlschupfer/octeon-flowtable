@@ -10,8 +10,9 @@ It reads conntrack over ctnetlink: a dump every 30 s, plus DESTROY events for co
 that end in between. Netdev counters can't be used, because offloaded packets bypass them;
 `octeon_flowtable` feeds its byte counts back into conntrack instead.
 
-- **Client:** the LAN endpoint, by MAC. Named from dnsmasq or ISC dhcpd leases, else from
-  reverse DNS if the name resolves back to the same address. The router's own internet
+- **Client:** the LAN endpoint, by MAC. Named from dnsmasq, ISC dhcpd or odhcpd leases
+  (DHCPv4/v6), preferring the leased IPv6 address's neighbour MAC over the DUID MAC, else
+  from reverse DNS if the name resolves back to the same address. The router's own internet
   traffic appears as `<hostname> (router)`.
 - **Application:** the nDPI id [flowclassd](../flowclassd/README.md) stores in the conntrack
   mark. Without flowclassd everything shows as "Unclassified"; the rest still works.

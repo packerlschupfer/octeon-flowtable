@@ -422,6 +422,27 @@ static void hn_set(const char *mac, const char *name)
 	snprintf(hns[i].name, sizeof(hns[i].name), "%s", name);
 }
 
+static int duid_mac(const char *duid, char mac[18])
+{
+	const char *p = NULL;
+	unsigned int b[6] = {};
+	size_t len = strlen(duid);
+
+	if (len == 28 && !strncmp(duid, "0001", 4))
+		p = duid + 16;
+	else if (len == 20 && !strncmp(duid, "0003", 4))
+		p = duid + 8;
+	else
+		return 0;
+
+	if (sscanf(p, "%2x%2x%2x%2x%2x%2x",
+		&b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
+		return 0;
+	snprintf(mac, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
+		b[0], b[1], b[2], b[3], b[4], b[5]);
+	return 1;
+}
+
 /* ISC dhcpd: static `host NAME { hardware ethernet MAC; ... }` blocks in the
  * config, then dynamic leases (`client-hostname "x";`), the latest wins. */
 static void load_names(void)
@@ -466,6 +487,58 @@ static void load_names(void)
 		while (fgets(l, sizeof(l), f))
 			if (sscanf(l, "%*s %31s %*s %63s", mac, name) == 2 && strcmp(name, "*"))
 				hn_set(mac, name);
+		fclose(f);
+	}
+
+	/* odhcpd */
+	if ((f = fopen("/tmp/odhcpd.leases", "r"))) {
+		time_t t = time(NULL);
+		static const char *skip = " \t\r\n";
+
+		while (fgets(l, sizeof(l), f)) {
+			char *save = NULL, *id = NULL, *kind = NULL,
+				*host = NULL, *expiry = NULL, *end = NULL, *tok = NULL;
+			long long valid = -1;
+			const char *m = NULL;
+
+			if (strncmp(l, "# ", 2) || !strtok_r(l + 2, skip, &save))
+				continue;
+			id = strtok_r(NULL, skip, &save);
+			kind = strtok_r(NULL, skip, &save);
+			host = strtok_r(NULL, skip, &save);
+			expiry = strtok_r(NULL, skip, &save);
+			if (!expiry || !strcmp(host, "-") || strchr(host, '\\'))
+				continue;
+			valid = strtoll(expiry, &end, 10);
+			if (*end || (valid != -1 && valid <= t))
+				continue;
+
+			if (!strcmp(kind, "ipv4")) {
+				if (strlen(id) == 17)
+					hn_set(id, host);
+				continue;
+			}
+
+			/* Skip IA_PD, require IA_NA */
+			if (!strtok_r(NULL, skip, &save) ||
+				!(tok = strtok_r(NULL, skip, &save)) || strcmp(tok, "128"))
+				continue;
+			/* Prefer the currently active NIC. */
+			while ((tok = strtok_r(NULL, skip, &save))) {
+				struct in6_addr address6 = {};
+				char *slash = strrchr(tok, '/');
+
+				if (!slash || strcmp(slash + 1, "128"))
+					continue;
+				*slash = 0;
+				if (inet_pton(AF_INET6, tok, &address6) == 1 && (m = nb_mac(tok))) {
+					hn_set(m, host);
+					break;
+				}
+			}
+			if (!m && duid_mac(id, mac))
+				hn_set(mac, host);
+		}
 		fclose(f);
 	}
 }

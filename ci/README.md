@@ -30,15 +30,15 @@ device. Add another `config-*.seed` + a matrix entry to ship another variant.
 
 The staging kernel patch itself lives at
 [`../src/staging-patches/120-octeon-flowtable-hooks.patch`](../src/staging-patches/);
-the workflow copies it into `target/linux/octeon/patches-6.18/` before building. The pinned
-kernel gets no stable updates by itself: bump the pin, or add a backport under
-`src/kernel-patches/` (the workflow copies any `*.patch` there), when a fix matters.
+the workflow copies it into `target/linux/octeon/patches-6.18/` before building, along
+with the security backports in [`../src/kernel-patches/`](../src/kernel-patches/). The
+pinned kernel gets no stable updates by itself, so add a backport there when a fix matters.
 
 ## Pinning / reproducibility
 
 Everything is pinned so a given tag reproduces:
 
-- **OpenWrt**: `OPENWRT_REF` in the workflow (`382a2109`, main @ 2026-11-01, kernel 6.18.60).
+- **OpenWrt**: `OPENWRT_REF` in the workflow (`84f4f77`, main @ 2026-06-03, kernel 6.18.34).
 - **packages feed**: the `^<rev>` in `feeds.conf`.
 - The driver `.c` and the staging patch are in this repo.
 
@@ -60,12 +60,13 @@ much faster. Free for public repos.
 
 ```sh
 git clone https://git.openwrt.org/openwrt/openwrt.git && cd openwrt
-git checkout 382a2109c849a45873aa908b4912fab667f603a0
+git checkout 84f4f779204a3de631670fee69141188b56e4976
 cp /path/to/octeon-flowtable/ci/feeds.conf feeds.conf
 echo "src-link flowoffload /path/to/octeon-flowtable/package" >> feeds.conf
 ./scripts/feeds update -a && ./scripts/feeds install -a -p flowoffload
 ./scripts/feeds install kmod-octeon-flowtable conntrack tcpdump
 cp /path/to/octeon-flowtable/src/staging-patches/120-octeon-flowtable-hooks.patch \
+   /path/to/octeon-flowtable/src/kernel-patches/*.patch \
    target/linux/octeon/patches-6.18/
 sh /path/to/octeon-flowtable/ci/apply-target-tweaks.sh "$PWD"
 cp /path/to/octeon-flowtable/ci/config.seed .config && make defconfig   # or config-router.seed

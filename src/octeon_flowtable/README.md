@@ -16,7 +16,7 @@ routing, untagged + 802.1Q + QinQ.
 The kernel must carry `../staging-patches/120-octeon-flowtable-hooks.patch`, which
 adds the exported hook/transmit/port/AQM symbols to the in-tree (built-in)
 `octeon_ethernet` driver. Drop it into `target/linux/octeon/patches-6.18/` and
-rebuild the kernel. (It applies clean against pristine 6.18.60.)
+rebuild the kernel. (It applies clean against pristine 6.18.34.)
 
 ## Build
 

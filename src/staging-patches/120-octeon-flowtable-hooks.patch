@@ -1,9 +1,9 @@
---- a/drivers/staging/octeon/ethernet-rx.h
-+++ b/drivers/staging/octeon/ethernet-rx.h
+--- a/drivers/staging/octeon/ethernet-rx.h	2026-06-01 17:51:08.000000000 +0200
++++ b/drivers/staging/octeon/ethernet-rx.h	2026-06-04 14:15:59.693532545 +0200
 @@ -9,6 +9,16 @@
+ void cvm_oct_rx_initialize(void);
+ void cvm_oct_rx_shutdown(void);
  
- void cvm_oct_poll_controller(struct net_device *dev);
- void cvm_oct_rx_initialize(struct platform_device *pdev);
 +/*
 + * WQE-level RX intercept hook for flow offload (octeon_flowtable). Called in
 + * the POW work loop before any skb is built. Return non-zero if the hook
@@ -14,15 +14,15 @@
 +void cvm_oct_register_rx_hook(cvm_oct_rx_hook_t hook);
 +void cvm_oct_unregister_rx_hook(void);
 +
- void cvm_oct_rx_shutdown(struct platform_device *pdev);
- 
- static inline void cvm_oct_rx_refill_pool(struct platform_device *pdev,
---- a/drivers/staging/octeon/ethernet-rx.c
-+++ b/drivers/staging/octeon/ethernet-rx.c
+ static inline void cvm_oct_rx_refill_pool(int fill_threshold)
+ {
+ 	int number_to_free;
+--- a/drivers/staging/octeon/ethernet-rx.c	2026-06-01 17:51:08.000000000 +0200
++++ b/drivers/staging/octeon/ethernet-rx.c	2026-06-04 14:15:59.693532545 +0200
 @@ -31,6 +31,30 @@
- #include "ethernet-util.h"
  
  static atomic_t oct_rx_ready = ATOMIC_INIT(0);
+ 
 +/*
 + * Optional WQE-level RX intercept hook (flow offload). NULL when no consumer
 + * is registered. Read once per packet in the work loop; updated only via the
@@ -47,10 +47,10 @@
 +}
 +EXPORT_SYMBOL(cvm_oct_unregister_rx_hook);
 +
- 
- /**
-  * cvm_oct_do_interrupt - interrupt handler.
-@@ -272,6 +296,19 @@
+ static struct oct_rx_group {
+ 	int irq;
+ 	int group;
+@@ -277,6 +301,19 @@
  				continue;
  		}
  
@@ -191,8 +191,8 @@
   * cvm_oct_xmit_pow - transmit a packet to the POW
   * @skb:    Packet to send
   * @dev:    Device info structure
---- a/drivers/staging/octeon/ethernet-tx.h
-+++ b/drivers/staging/octeon/ethernet-tx.h
+--- a/drivers/staging/octeon/ethernet-tx.h	2026-06-01 17:51:08.000000000 +0200
++++ b/drivers/staging/octeon/ethernet-tx.h	2026-06-04 17:02:59.804358640 +0200
 @@ -9,6 +9,8 @@
  netdev_tx_t cvm_oct_xmit_pow(struct sk_buff *skb, struct net_device *dev);
  int cvm_oct_transmit_qos(struct net_device *dev, void *work_queue_entry,

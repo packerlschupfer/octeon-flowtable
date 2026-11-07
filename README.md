@@ -46,6 +46,7 @@ docs/      design RFC, hardware model, behavioural spec, build + install guides,
 src/octeon_flowtable/     the kernel module
 src/octeon_flowtable/tests/  regression suite + nft/topology rigs (see Testing)
 src/staging-patches/      the octeon_ethernet hook patch (adds the exported hooks)
+src/kernel-patches/       security backports for the pinned 6.18.34 kernel
 package/octeon-flowtable/ OpenWrt kmod package (init script + UCI config)
 src/flowclassd/, src/trafficd/, package/{flowclassd,trafficd,luci-app-trafficd}/, src/fw4-patches/
            optional DPI + traffic analysis page (in the `dpi` release image)
@@ -54,8 +55,9 @@ prompts/   reproducible runbooks (build / deploy / EdgeOS→OpenWrt config migra
 
 ## Quick start
 
-1. Apply `src/staging-patches/120-octeon-flowtable-hooks.patch` to your OpenWrt
-   octeon kernel (`target/linux/octeon/patches-6.18/`) and rebuild.
+1. Apply `src/staging-patches/120-octeon-flowtable-hooks.patch` and
+   `src/kernel-patches/*.patch` to your OpenWrt octeon kernel
+   (`target/linux/octeon/patches-6.18/`) and rebuild.
 2. Build the module: `cd src/octeon_flowtable && make octeon OWRT=/path/to/openwrt`
    (or select **kmod-octeon-flowtable** from `package/` in menuconfig).
 3. Enable hardware offload in `/etc/config/firewall`:
@@ -81,7 +83,7 @@ Three variants are published (asset names prefixed `lean-` / `router-` / `dpi-`)
 - **dpi** — router + flowclassd (application classification) + trafficd (traffic page at
   `/traffic/`, no login: see the [privacy note](src/trafficd/README.md)).
 
-The build is fully pinned (OpenWrt main @ `382a2109`, kernel 6.18.60, pinned
+The build is fully pinned (OpenWrt main @ `84f4f77`, kernel 6.18.34 plus security backports, pinned
 `packages`/`luci` feeds) so a given tag reproduces byte-for-byte — see [`ci/`](ci/).
 
 > ⚠ **Unofficial community image for EOL hardware — flash at your own risk.** The
@@ -125,7 +127,7 @@ combination, byte-exact), extracted straight from the driver source.
 ## Status & caveats
 
 Tested on the [ERLite-3](https://openwrt.org/toh/ubiquiti/edgerouter_lite) / CN5020
-against OpenWrt's kernel 6.18.60 (see that page for the device's hardware specs,
+against OpenWrt's kernel 6.18.34 (see that page for the device's hardware specs,
 serial-console pinout, and the stock OpenWrt install/recovery procedure). The
 CN50xx is a ~2008-era Octeon Plus part, long since discontinued; this exists
 because it's a tractable hardware-fast-path target on cheap silicon, not because

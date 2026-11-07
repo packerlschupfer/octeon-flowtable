@@ -27,10 +27,10 @@ put it in the `bootcmd`.
 ## 2. Apply the staging hook patch
 
 ```sh
-cp src/staging-patches/120-octeon-flowtable-hooks.patch \
+cp src/staging-patches/120-octeon-flowtable-hooks.patch src/kernel-patches/*.patch \
    <openwrt>/target/linux/octeon/patches-6.18/
 # verify it applies clean (optional):
-#   tar xf dl/linux-6.18.60.tar.xz && cd linux-6.18.60 && \
+#   tar xf dl/linux-6.18.34.tar.xz && cd linux-6.18.34 && \
 #   patch -p1 --dry-run < .../120-octeon-flowtable-hooks.patch
 ```
 
@@ -52,7 +52,7 @@ Or just select **kmod-octeon-flowtable** (drop `package/octeon-flowtable` into
 When you edit the staging hook (ethernet-rx/tx), a full `make` is slow. Incremental:
 
 ```sh
-cd <openwrt>/build_dir/target-*/linux-octeon_generic/linux-6.18.60
+cd <openwrt>/build_dir/target-*/linux-octeon_generic/linux-6.18.34
 make ARCH=mips CROSS_COMPILE=<tc>/mips64-openwrt-linux-musl- vmlinux -j$(nproc)
 ```
 

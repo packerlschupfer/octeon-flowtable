@@ -16,7 +16,7 @@ name: build-image
 #   * push of a tag  v*      -> build all variants + publish ONE GitHub Release
 #   * workflow_dispatch      -> build all variants, upload artifacts (no release)
 #
-# Everything is pinned (OpenWrt rev, feed revs, kernel 6.18.34) for reproducibility;
+# Everything is pinned (OpenWrt rev, feed revs, kernel 6.18.60) for reproducibility;
 # bump OPENWRT_REF here and the feed revs in ci/feeds.conf together.
 
 on:
@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
 
 env:
-  OPENWRT_REF: 84f4f779204a3de631670fee69141188b56e4976   # OpenWrt main @ 2026-06-03, kernel 6.18.34
+  OPENWRT_REF: 382a2109c849a45873aa908b4912fab667f603a0   # OpenWrt main @ 2026-11-01, kernel 6.18.60
   OPENWRT_URL: https://git.openwrt.org/openwrt/openwrt.git
 
 jobs:
@@ -82,9 +82,10 @@ jobs:
         run: |
           cp "$GITHUB_WORKSPACE/octeon-flowtable/src/staging-patches/120-octeon-flowtable-hooks.patch" \
              target/linux/octeon/patches-6.18/
-          # Security backports the pinned 6.18.34 kernel does not have yet.
-          cp "$GITHUB_WORKSPACE"/octeon-flowtable/src/kernel-patches/*.patch \
-             target/linux/octeon/patches-6.18/
+          # Optional security backports for the pinned kernel (none needed right now).
+          for p in "$GITHUB_WORKSPACE"/octeon-flowtable/src/kernel-patches/*.patch; do
+            [ -e "$p" ] && cp "$p" target/linux/octeon/patches-6.18/
+          done
           sh "$GITHUB_WORKSPACE/octeon-flowtable/ci/apply-target-tweaks.sh" "$PWD"
           if [ "${{ matrix.variant }}" = dpi ]; then
             mkdir -p package/network/config/firewall4/patches
@@ -189,6 +190,6 @@ jobs:
           - **router** — lean + LuCI web UI + WireGuard, for a more turnkey home router.
           - **dpi** — router + flowclassd (application classification) + trafficd (traffic page at /traffic/). The page has no login: see the privacy note in \`src/trafficd/README.md\`.
 
-          Base: OpenWrt main @ \`${OPENWRT_REF}\` (kernel 6.18.34 plus the backports in \`src/kernel-patches/\`). Reproducible from this tag — see \`ci/\` and \`docs/BUILDING.md\`.
+          Base: OpenWrt main @ \`${OPENWRT_REF}\` (kernel 6.18.60). Reproducible from this tag — see \`ci/\` and \`docs/BUILDING.md\`.
 
           **Unofficial community image for EOL hardware — flash at your own risk.** The ERLite installs via USB stick / U-Boot, not web sysupgrade; recovery over U-Boot/TFTP is in \`docs/INSTALLING.md\`. Verify the \`sha256sums-*.txt\` before flashing."

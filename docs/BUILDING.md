@@ -23,7 +23,7 @@ target (CN50xx — e.g. the EdgeRouter Lite 3).
   make -j$(nproc) tools/install toolchain/install   # first time only; slow
   ```
 - This repo checked out somewhere (referred to below as `<repo>`).
-- The build was developed against **OpenWrt's kernel 6.18.34**; other 6.x should
+- The build was developed against **OpenWrt's kernel 6.18.60**; other 6.x should
   work but the staging patch path (`patches-6.18`) and line offsets may need a
   refresh.
 
@@ -34,17 +34,16 @@ The offload needs a few exported hooks added to the in-tree (built-in)
 
 ```sh
 cp <repo>/src/staging-patches/120-octeon-flowtable-hooks.patch \
-   <repo>/src/kernel-patches/*.patch \
    <openwrt>/target/linux/octeon/patches-6.18/
 ```
 
 It adds: `cvm_oct_register_rx_hook` / `cvm_oct_unregister_rx_hook` (the WQE-level
 RX intercept in `cvm_oct_poll`), `cvm_oct_transmit_qos` (WQE→PKO egress, with the
 AQM FAU op), `cvm_oct_get_port`, and `cvm_oct_flow_aqm_fau`. It applies clean
-against pristine 6.18.34 — verify if you like:
+against pristine 6.18.60 — verify if you like:
 
 ```sh
-cd <openwrt> && tar xf dl/linux-6.18.34.tar.xz && cd linux-6.18.34
+cd <openwrt> && tar xf dl/linux-6.18.60.tar.xz && cd linux-6.18.60
 patch -p1 --dry-run < ../target/linux/octeon/patches-6.18/120-octeon-flowtable-hooks.patch
 ```
 
@@ -114,7 +113,7 @@ If flowclassd stops, traffic keeps flowing and offloading, just unclassified.
 cd <repo>/src/octeon_flowtable
 make octeon OWRT=<openwrt>          # auto-finds KDIR + the mips64 toolchain
 # or fully manual:
-make KDIR=<openwrt>/build_dir/target-*/linux-octeon_generic/linux-6.18.34 \
+make KDIR=<openwrt>/build_dir/target-*/linux-octeon_generic/linux-6.18.60 \
      ARCH=mips CROSS_COMPILE=<openwrt>/staging_dir/toolchain-*/bin/mips64-openwrt-linux-musl-
 ```
 
@@ -132,7 +131,7 @@ USB-booted ERLite — is in **[prompts/build.md](../prompts/build.md)**.
 
 ## Troubleshooting
 
-- **`.rej` when the patch applies**: your kernel version differs from 6.18.34;
+- **`.rej` when the patch applies**: your kernel version differs from 6.18.60;
   regenerate the patch against your tree (it's a plain diff of four staging files
   under `drivers/staging/octeon/`).
 - **`insmod`: "Unknown symbol cvm_oct_…"**: the running kernel doesn't have the

@@ -38,6 +38,24 @@ scp <variant>-…-squashfs-sysupgrade.tar root@<box>:/tmp/
 ssh root@<box> 'sysupgrade -n /tmp/<variant>-…-squashfs-sysupgrade.tar'   # -n: don't keep settings
 ```
 
+### Upgrading from an earlier octeon-flowtable release
+
+Already running one of these images? Upgrade with a normal `sysupgrade` that
+**keeps** your settings: the same commands as A, but without `-n`. Download the
+same variant you have installed, and check it against its `sha256sums-*.txt` first.
+
+```sh
+sha256sum -c --ignore-missing sha256sums-<variant>.txt
+scp -O <variant>-…-squashfs-sysupgrade.tar root@<box>:/tmp/   # -O: the box has no SFTP server
+ssh root@<box> 'sysupgrade -v /tmp/<variant>-…-squashfs-sysupgrade.tar'
+```
+
+The box reboots after about two minutes with your configuration intact. Then
+check that `uname -r` shows the kernel named in the release notes, and run the
+checks in [6. Verify](#6-verify). LuCI's **System → Backup / Flash Firmware**
+with "Keep settings" runs the same `sysupgrade`; the command line above is the
+tested path.
+
 ### B. Fresh install / coming from EdgeOS → write the USB stick on a PC
 
 Pull the stick, plug it into a Linux PC, and write it directly. **This erases the

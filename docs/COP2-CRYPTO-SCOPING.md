@@ -4,6 +4,10 @@
 project, distinct from `octeon_flowtable` (different hardware block, different
 kernel subsystem). Written so a future effort can start from facts, not vibes.*
 
+*Updated 2026-11-21: the COP2 cipher encodings are published in a BSD-licensed
+header (Oracle UEK7), and a user-space OpenSSL provider is a second route; see
+"Clean-room feasibility" and "User-space route".*
+
 ## Why this is a different project from the flow offload
 
 The flow offload (`octeon_flowtable`) accelerates **plaintext L3/L4 forwarding** —
@@ -47,25 +51,29 @@ bandwidth → a realistic **3–5× IPsec throughput** win, but still CPU-bound
 
 ## Clean-room feasibility (the crux)
 
-This project's rule: GPL sources only, no Cavium SDK, no UBNT binary.
+This project's rule: openly published kernel sources only (GPL kernel trees, including
+the BSD-licensed Cavium `cvmx-*.h` headers they carry), no Cavium SDK, no UBNT binary.
 
 - **Hashes**: trivially clean — the GPL kernel already has them. The hash COP2
   path is raw register access (`crypto.h`: `dmtc2 rt, 0x0048+index` etc.), no
   named cipher macros involved.
-- **Ciphers**: the COP2 AES/3DES/GMUL register indices and `dmtc2` function codes
-  are **not** in any GPL source on hand. **Confirmed** by a system-wide search
-  (the GPL `cvmx-asm.h`/`crypto.h`, the reference kernel tree, the OpenWrt build):
-  zero AES/3DES COP2 macros — only the hash registers are exposed. The SDK's
-  `cvmx-asm.h` had `CVMX_MT_AES_*` / `CVMX_MF_AES_*` / `CVMX_MT_3DES_*`, but that's
-  SDK. **This is the gate for the whole project**: without the cipher encodings,
-  only the auth (HMAC-SHA) half of IPsec can be accelerated, and the cipher (the
-  bulk cost) stays software. The encodings **are** in the public
-  **OCTEON Programmer's Reference / HW Reference Manual** (COP2 instruction
-  encodings) — the same class of public doc this project already used for the
-  PIP/POW/PKO blocks. So: feasible, but the cipher instruction encodings must be
-  re-derived from the public HRM, not copied from the SDK. Budget real time for
-  getting the register indices/byte-order exactly right (debugging a wrong AES
-  round is painful — same flavour as the big-endian mangle bug here).
+- **Ciphers**: the COP2 AES/3DES/GMUL register indices and `dmtc2`/`dmfc2`
+  function codes are **not** in mainline's `cvmx-asm.h` (it carries only the hash
+  registers; `crypto.h` the same). **Correction (2026-11-21):** they *are*
+  published outside the SDK. Oracle's UEK7 kernel tree
+  (`arch/mips/include/asm/octeon/cvmx-asm.h`, branch `uek7/u3`) ships the full
+  header with `CVMX_MT_AES_*` / `CVMX_MF_AES_*`, `CVMX_MT_3DES_*` and the GF(2^128)
+  `CVMX_MT_GFM_*` / `CVMX_MF_GFM_*` macros. The header is Cavium's BSD-style licence, the same licence and origin
+  as the `cvmx-*.h` headers in mainline that `octeon_flowtable` already builds
+  against, and compatible with a GPLv2 kernel module. So the encodings come from
+  an openly published, permissively licensed header, not from the SDK, and need no
+  re-derivation from the hardware manual. What stays hard is using them correctly
+  (key/IV register layout, byte order, the CBC/GCM chaining) and verifying against
+  known-answer tests. (Pointer from a community member on the project's Discord.)
+- **Not usable as code**: wolfSSL's `wolfcrypt/src/port/cavium/cavium_octeon_sync.c`
+  implements COP2 3DES/AES-CBC/AES-GCM, but it builds on the SDK headers and is
+  GPLv3, so it can't go into a GPLv2 kernel driver. Useful only as confirmation of
+  which operations the unit supports.
 
 ## Integration shape
 
@@ -82,7 +90,9 @@ This project's rule: GPL sources only, no Cavium SDK, no UBNT binary.
 
 ## Challenges / risks
 
-1. **Cipher instruction encoding from the HRM** (the clean-room cost above).
+1. **Correct use of the cipher registers**: the encodings are available (see
+   above), but key/IV layout, byte order and CBC/GCM chaining must be right;
+   verify against known-answer tests before anything else.
 2. **COP2 context**: state is per-core and saved/restored on the CU2 exception;
    the enable/disable bracket + no-preempt is mandatory, and getting it wrong
    corrupts another task's crypto or oopses. The upstream hash drivers are the
@@ -92,10 +102,27 @@ This project's rule: GPL sources only, no Cavium SDK, no UBNT binary.
    thoughtfully; measure against software to prove the win is real.
 4. **Scope creep**: do AES-GCM (modern IPsec) first; 3DES/DES is legacy.
 
+## User-space route (OpenSSL provider)
+
+Mainline Linux already lets ordinary processes use COP2 on Octeon: on a task's
+first COP2 instruction the CU2 exception handler (`cnmips_cu2_call` in
+`arch/mips/cavium-octeon/cpu.c`) enables the unit for that task and restores its
+saved state, and the context switch saves and restores COP2 state from then on.
+So an **OpenSSL 3 provider** using the COP2 AES/GCM (and hash) instructions needs
+no kernel changes. It would speed up everything that does crypto in user space
+through OpenSSL: OpenVPN, TLS servers and clients, strongSwan's IKE. It does
+**not** help kernel IPsec (ESP runs in the kernel crypto API) or WireGuard.
+AF_ALG and cryptodev, the older ways to reach kernel crypto from user space, add
+a syscall per operation and aren't worth it here.
+
+Of the two routes, the provider is the smaller first step (no kernel code, easy
+to test against OpenSSL's own known-answer tests); the kernel driver below is
+the one that serves IPsec.
+
 ## Milestones
 
 0. Enable the upstream COP2 **hash** drivers; measure HMAC-SHA speedup. (Hours.)
-1. Clean-room **AES-CBC** `skcipher` from the HRM; KAT-verify vs the generic
+1. **AES-CBC** `skcipher` using the UEK7 `cvmx-asm.h` encodings; KAT-verify vs the generic
    driver (`tcrypt`); wire one cn50xx core. (The hard, encoding-sensitive step.)
 2. **AES-GCM** `aead` (incl. the GF multiply) + the rfc4106 IPsec wrapper.
 3. IPsec end-to-end: a tunnel up, throughput vs software, both cores.
@@ -103,15 +130,16 @@ This project's rule: GPL sources only, no Cavium SDK, no UBNT binary.
 
 ## Honest assessment — and why not now
 
-- **Value is real but narrow**: it accelerates **IPsec termination only**.
+- **Value is real but narrow**: the kernel driver accelerates **IPsec termination**;
+  the user-space provider accelerates OpenSSL users (OpenVPN, TLS).
   **WireGuard cannot be accelerated on this silicon at all** — CN50xx (≈2008) has
   no ChaCha20/Poly1305 hardware; that crypto is software-only forever here.
-- **No current consumer**: the gw doesn't terminate (or, now, even forward) any
-  VPN. Like QinQ, this would be speculative.
+- **No current consumer**: the gw terminates only WireGuard, which COP2 can't
+  help, and runs no IPsec or OpenVPN. Like QinQ, this would be speculative.
 - **EOL silicon, modest ceiling**: even done well, ~300–600 Mbps AES-GCM on two
   500 MHz cores.
 - It's a **genuinely interesting clean-room exercise** (COP2 coprocessor
-  programming from the public HRM, crypto-API integration) and a natural sibling
+  programming from the published register encodings, crypto-API integration) and a natural sibling
   to the flow-offload work — but it's a *new* project, not a continuation, and
   there's no use case driving it today. Start it only if a real IPsec-termination
-  need appears on the box.
+  need, or an OpenVPN/TLS throughput need, appears on the box.

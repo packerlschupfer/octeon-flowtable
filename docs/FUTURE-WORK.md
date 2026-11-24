@@ -5,9 +5,6 @@
 kept as the design and measurement record. Updated 2026-11-24.*
 
 ## Open items (2026-11)
-- **IPv6 over PPPoE**: implemented in the PPPoE path, not yet bench-tested.
-- **`lean` and `router` images**: built by CI for every release, but only the
-  `dpi` image is boot-tested on hardware.
 - **QoS for offloaded traffic** (CAKE/HTB with a hand-off into the Linux queues):
   contributor work in progress, see issue #11. Must be off by default and leave
   the offload unchanged when disabled.
@@ -25,6 +22,13 @@ kept as the design and measurement record. Updated 2026-11-24.*
 - A security hardening pass of the module (in every release since v0.1.0).
 - Kernel 6.18.60 base (OpenWrt `382a2109`, v0.4.0 and v0.4.2).
 - Multi-flow VLAN throughput re-measured on a proper NIC (see section 1).
+- IPv6 over PPPoE bench-tested (2026-11-24, kernel 6.18.60, PPPoE server on
+  the WAN cable, MTU 1492): 905-916 Mbps up and down, single stream and -P4,
+  `[HW_OFFLOAD]`, `tx_fail` 0. IPv4 over the same session 902-917. A
+  1500-byte IPv6 packet gets "Packet Too Big, mtu 1492" from the router and a
+  1492-byte one passes, so PMTUD works.
+- All three v0.4.2 images boot-tested on hardware: `lean` 931-935 Mbps, `router`
+  928-932 (LuCI login works), `dpi` 916-932; 5-minute soaks without errors.
 
 ## Done since M2
 - ✅ Per-flow stats → `conntrack -L` visibility + keep-alive (`octeon_ft_stats`).

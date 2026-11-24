@@ -927,9 +927,9 @@ static int octeon_ft_rx_pppoe(struct cvmx_wqe *work)
 	 * No error report does not prove that the inner checksum was checked;
 	 * a corrupt segment may still be forwarded.
 	 */
-	if (!work->word2.s.not_IP && !work->word2.s.IP_exc &&
-	    !work->word2.s.is_frag && work->word2.s.L4_error &&
-	    work->word2.s.err_code == CVMX_PIP_CHK_ERR)
+	if (unlikely(!work->word2.s.not_IP && !work->word2.s.IP_exc &&
+		     !work->word2.s.is_frag && work->word2.s.L4_error &&
+		     work->word2.s.err_code == CVMX_PIP_CHK_ERR))
 		goto bad;
 	ph = l2 + off + 2;
 	ip_off = off + 2 + OCT_PPPOE_HLEN;

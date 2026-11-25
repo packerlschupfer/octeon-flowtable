@@ -243,6 +243,7 @@ static inline void octeon_ft_ppp_key_rx(struct octeon_ft_ppp_key *key,
 	memcpy(key->macs, l2, sizeof(key->macs));
 }
 
+/* Keep rhashtable keys word-sized and aligned for jhash2 on MIPS. */
 struct octeon_ft_key {
 	__be32	saddr;
 	__be32	daddr;
@@ -257,8 +258,7 @@ struct octeon_ft_key {
 	u16	iif_port;	/* ingress octeon PIP port — disambiguates the
 				 * same 5-tuple+VLAN on different physical ports
 				 * (multi-homing / policy routing). */
-	struct octeon_ft_ppp_key ppp;
-} __packed;
+} __packed __aligned(4);
 
 /* IPv6 5-tuple key (separate table; v6 is routed, never NAT'd, so no rewrite of
  * the addresses/ports — only MAC + hop limit change). */
@@ -272,8 +272,16 @@ struct octeon_ft_key6 {
 	u16		vlan_id;
 	u16		vlan_id2;
 	u16		iif_port;	/* ingress octeon PIP port (see v4 key) */
-	struct octeon_ft_ppp_key ppp;
-} __packed;
+} __packed __aligned(4);
+
+/* Both directions use this table. A zero SID denotes plain IP ingress
+ * heading towards a PPPoE egress. IPv4 occupies the prefix of tuple[].
+ */
+struct octeon_ft_pppoe_key {
+	u8 tuple[sizeof(struct octeon_ft_key6)];
+	struct octeon_ft_ppp_key session;
+	u8 is_v6;
+} __packed __aligned(4);
 
 /*
  * The decoded rewrite. We do NOT replay the flowtable's raw MANGLE words: those
@@ -294,10 +302,11 @@ struct octeon_ft_rewrite {
 };
 
 struct octeon_ft_flow {
-	struct rhash_head	node;		/* in the v4 OR the v6 table */
+	struct rhash_head	node;		/* in exactly one data-path table */
 	struct rhash_head	cookie_node;	/* keyed by cookie (control path) */
 	struct octeon_ft_key	key;		/* used when !is_v6 */
 	struct octeon_ft_key6	key6;		/* used when is_v6 */
+	struct octeon_ft_pppoe_key ppp_key;
 	bool			is_v6;
 	unsigned long		cookie;
 	struct net_device	*out_dev;	/* physical octeon port for PKO;
@@ -316,7 +325,7 @@ struct octeon_ft_flow {
 	u8			n_eg;		/* egress tag count: 0, 1 or 2 */
 	u8			eport;		/* egress octeon port (AQM counter idx) */
 	u16			eg_vid[2];	/* wire order: [0]=outer, [1]=inner */
-	/* Egress PPPoE session and logical endpoint (held until flow free). */
+	/* PPPoE endpoint: ifindex only, no netdev reference. */
 	u32			ppp_ifindex;
 	u64			ppp_generation;
 	u8			ppp_port;
@@ -342,12 +351,18 @@ static const struct rhashtable_params octeon_ft_rht_params = {
 	.automatic_shrinking = true,
 };
 
-/* IPv6 data-path table; same `node` field (a flow lives in exactly one of the
- * two tables, chosen by is_v6). */
+/* IPv6 data-path table for flows without PPPoE encapsulation. */
 static const struct rhashtable_params octeon_ft_rht6_params = {
 	.head_offset	= offsetof(struct octeon_ft_flow, node),
 	.key_offset	= offsetof(struct octeon_ft_flow, key6),
 	.key_len	= sizeof(struct octeon_ft_key6),
+	.automatic_shrinking = true,
+};
+
+static const struct rhashtable_params octeon_ft_pppoe_params = {
+	.head_offset	= offsetof(struct octeon_ft_flow, node),
+	.key_offset	= offsetof(struct octeon_ft_flow, ppp_key),
+	.key_len	= sizeof(struct octeon_ft_pppoe_key),
 	.automatic_shrinking = true,
 };
 
@@ -363,6 +378,10 @@ static const struct rhashtable_params octeon_ft_cookie_params = {
 
 static struct rhashtable octeon_ft_table;
 static struct rhashtable octeon_ft_table6;
+static struct rhashtable octeon_ft_pppoe_table;
+static atomic_t octeon_ft_ppp_tx_rules = ATOMIC_INIT(0);
+/* Serialize REPLACE across the plain and PPPoE tables, not RX lookups. */
+static DEFINE_MUTEX(octeon_ft_replace_lock);
 static struct rhashtable octeon_ft_cookie_table;
 static atomic_t octeon_ft_count = ATOMIC_INIT(0);
 static atomic_t octeon_ft_hits = ATOMIC_INIT(0);
@@ -408,7 +427,7 @@ MODULE_PARM_DESC(r_ctl, "rejects: TCP syn/fin/rst punted");
 module_param_cb(r_miss, &octeon_ft_atomic_ops, &octeon_ft_r_miss, 0444);
 MODULE_PARM_DESC(r_miss, "rejects: flow table lookup miss");
 module_param_cb(r_ppp, &octeon_ft_atomic_ops, &octeon_ft_r_ppp, 0444);
-MODULE_PARM_DESC(r_ppp, "rejects: PPPoE frame malformed or not a learned session");
+MODULE_PARM_DESC(r_ppp, "rejects: PPPoE frame missed or failed validation");
 
 /* ============================ data path ============================ */
 
@@ -598,6 +617,22 @@ static inline int octeon_ft_l2_grow(const struct octeon_ft_flow *flow, int n_ig,
  * already located; PIP guarantees no extension headers/frags here (those set
  * IP_exc / is_frag and are rejected upstream). Returns 1 if consumed.
  */
+/* Called under RCU. Keep the larger temporary key off the plain hit path. */
+static noinline struct octeon_ft_flow *
+octeon_ft_lookup_pppoe(const void *tuple, bool is_v6, u16 sid, u8 tags,
+		       const u8 *l2)
+{
+	struct octeon_ft_pppoe_key key = {};
+
+	memcpy(key.tuple, tuple, is_v6 ? sizeof(struct octeon_ft_key6) :
+				       sizeof(struct octeon_ft_key));
+	key.is_v6 = is_v6;
+	if (sid)
+		octeon_ft_ppp_key_rx(&key.session, sid, tags, l2);
+	return rhashtable_lookup(&octeon_ft_pppoe_table, &key,
+				 octeon_ft_pppoe_params);
+}
+
 static int octeon_ft_rx6(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 			 int n_ig, u16 vid0, u16 vid1, u16 sid)
 {
@@ -633,18 +668,20 @@ static int octeon_ft_rx6(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 	key.vlan_id2 = vid1;
 	key.iif_port = cvmx_wqe_get_port(work);
 
-	if (ig_ppp)
-		octeon_ft_ppp_key_rx(&key.ppp, sid, n_ig, l2);
 	rcu_read_lock();
-	flow = rhashtable_lookup(&octeon_ft_table6, &key, octeon_ft_rht6_params);
+	if (ig_ppp) {
+		flow = octeon_ft_lookup_pppoe(&key, true, sid, n_ig, l2);
+	} else {
+		flow = rhashtable_lookup(&octeon_ft_table6, &key, octeon_ft_rht6_params);
+		if (!flow && atomic_read(&octeon_ft_ppp_tx_rules))
+			flow = octeon_ft_lookup_pppoe(&key, true, 0, 0, NULL);
+	}
 	if (!flow && !ig_ppp && n_ig && !READ_ONCE(octeon_ft_vlan_strict)) {
 		/* VLAN-agnostic bridged-VLAN rules — see octeon_ft_rx. */
 		key.vlan_id = 0;
 		key.vlan_id2 = 0;
 		flow = rhashtable_lookup(&octeon_ft_table6, &key,
 					 octeon_ft_rht6_params);
-		if (flow && flow->ppp_ifindex)
-			flow = NULL;
 	}
 	if (!flow) {
 		rcu_read_unlock();
@@ -757,10 +794,14 @@ static int octeon_ft_fwd4(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 
 	key.iif_port = cvmx_wqe_get_port(work);
 
-	if (ig_ppp)
-		octeon_ft_ppp_key_rx(&key.ppp, sid, n_ig, l2);
 	rcu_read_lock();
-	flow = rhashtable_lookup(&octeon_ft_table, &key, octeon_ft_rht_params);
+	if (ig_ppp) {
+		flow = octeon_ft_lookup_pppoe(&key, false, sid, n_ig, l2);
+	} else {
+		flow = rhashtable_lookup(&octeon_ft_table, &key, octeon_ft_rht_params);
+		if (!flow && atomic_read(&octeon_ft_ppp_tx_rules))
+			flow = octeon_ft_lookup_pppoe(&key, false, 0, 0, NULL);
+	}
 	if (!flow && !ig_ppp && n_ig && !READ_ONCE(octeon_ft_vlan_strict)) {
 		/* Bridged-VLAN (lower-device) rules are VLAN-agnostic: the
 		 * kernel excludes in_vlan_ingress encaps from the match key
@@ -773,8 +814,6 @@ static int octeon_ft_fwd4(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 		key.vlan_id2 = 0;
 		flow = rhashtable_lookup(&octeon_ft_table, &key,
 					 octeon_ft_rht_params);
-		if (flow && flow->ppp_ifindex)
-			flow = NULL;
 	}
 	if (!flow) {
 		atomic_inc(&octeon_ft_r_miss);
@@ -902,9 +941,22 @@ static bool octeon_ft_ppp_l4_ok(const u8 *l4, unsigned int len, u8 proto)
 	if (proto == IPPROTO_TCP) {
 		const struct tcphdr *th = (const struct tcphdr *)l4;
 
-		return th->doff >= 5 && th->doff * 4 <= len;
+		return len >= sizeof(*th) && th->doff >= 5 && th->doff * 4 <= len;
 	}
-	return ntohs(((const struct udphdr *)l4)->len) == len;
+	return len >= sizeof(struct udphdr) &&
+	       ntohs(((const struct udphdr *)l4)->len) == len;
+}
+
+/* Incomplete L4 validation: punt on a checksum error reported in an
+ * IP WQE, but do not recompute the inner TCP/UDP checksum in software.
+ * No error report does not prove that the inner checksum was checked;
+ * a corrupt segment may still be forwarded.
+ */
+static bool octeon_ft_ppp_wqe_csum_error(const struct cvmx_wqe *work)
+{
+	return !work->word2.s.not_IP && !work->word2.s.IP_exc &&
+	       !work->word2.s.is_frag && work->word2.s.L4_error &&
+	       work->word2.s.err_code == CVMX_PIP_CHK_ERR;
 }
 
 /*
@@ -917,7 +969,7 @@ static int octeon_ft_rx_pppoe(struct cvmx_wqe *work)
 	u8 *l2 = octeon_ft_pkt_data(work), *ph, *l3;
 	unsigned int len = work->word1.len, off = 2 * ETH_ALEN, avail, plen;
 	u16 vid[2] = { 0, 0 }, et, proto, sid;
-	int n = 0, ip_off;
+	int n = 0, ip_off, ret;
 
 	if (len < off + 2)
 		return 0;
@@ -931,18 +983,9 @@ static int octeon_ft_rx_pppoe(struct cvmx_wqe *work)
 	}
 	if (et != ETH_P_PPP_SES)
 		return -1;
-	/* Incomplete L4 validation: punt on a checksum error reported in an
-	 * IP WQE, but do not recompute the inner TCP/UDP checksum in software.
-	 * No error report does not prove that the inner checksum was checked;
-	 * a corrupt segment may still be forwarded.
-	 */
-	if (!work->word2.s.not_IP && !work->word2.s.IP_exc &&
-		!work->word2.s.is_frag && work->word2.s.L4_error &&
-		work->word2.s.err_code == CVMX_PIP_CHK_ERR)
-		goto bad;
 	ph = l2 + off + 2;
 	ip_off = off + 2 + OCT_PPPOE_HLEN;
-	if (len < ip_off + sizeof(struct iphdr))
+	if (len < ip_off)
 		goto bad;
 	if (ph[0] != 0x11 || ph[1] != 0x00)		/* ver/type 1/1, session data */
 		goto bad;
@@ -960,21 +1003,25 @@ static int octeon_ft_rx_pppoe(struct cvmx_wqe *work)
 		struct iphdr *iph = (struct iphdr *)l3;
 		unsigned int ihl, tot;
 
-		if (iph->version != 4)
+		if (avail < sizeof(*iph) || iph->version != 4)
 			goto bad;
 		ihl = iph->ihl * 4;
 		tot = ntohs(iph->tot_len);
-		if (ihl != sizeof(*iph) || tot < ihl || tot != avail ||
-		    ip_is_fragment(iph) || ip_fast_csum(iph, iph->ihl))
+		if (ihl < sizeof(*iph) || tot < ihl || tot != avail)
 			goto bad;
-		if (!(iph->protocol == IPPROTO_TCP &&
-		      tot >= ihl + sizeof(struct tcphdr)) &&
-		    !(iph->protocol == IPPROTO_UDP &&
-		      tot >= ihl + sizeof(struct udphdr)))
+		if (ihl > sizeof(*iph))
+			return 0; /* Legal IPv4 options: leave them to Linux. */
+		if (ip_is_fragment(iph) || ip_fast_csum(iph, iph->ihl))
+			goto bad;
+		if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
 			return 0;
-		if (!octeon_ft_ppp_l4_ok(l3 + ihl, tot - ihl, iph->protocol))
+		if (unlikely(octeon_ft_ppp_wqe_csum_error(work)) ||
+		    !octeon_ft_ppp_l4_ok(l3 + ihl, tot - ihl, iph->protocol))
 			goto bad;
-		return octeon_ft_fwd4(work, l2, l3, ip_off, n, vid[0], vid[1], sid);
+		ret = octeon_ft_fwd4(work, l2, l3, ip_off, n, vid[0], vid[1], sid);
+		if (!ret)
+			goto bad;
+		return ret;
 	}
 	if (proto == OCT_PPP_IPV6) {
 		struct ipv6hdr *ip6 = (struct ipv6hdr *)l3;
@@ -985,14 +1032,17 @@ static int octeon_ft_rx_pppoe(struct cvmx_wqe *work)
 		pl = ntohs(ip6->payload_len);
 		if (sizeof(*ip6) + pl != avail)
 			goto bad;
-		if (!(ip6->nexthdr == IPPROTO_TCP && pl >= sizeof(struct tcphdr)) &&
-		    !(ip6->nexthdr == IPPROTO_UDP && pl >= sizeof(struct udphdr)))
+		if (ip6->nexthdr != IPPROTO_TCP && ip6->nexthdr != IPPROTO_UDP)
 			return 0;
-		if (!octeon_ft_ppp_l4_ok(l3 + sizeof(*ip6), pl, ip6->nexthdr) ||
+		if (unlikely(octeon_ft_ppp_wqe_csum_error(work)) ||
+		    !octeon_ft_ppp_l4_ok(l3 + sizeof(*ip6), pl, ip6->nexthdr) ||
 		    (ip6->nexthdr == IPPROTO_UDP &&
 		     !((const struct udphdr *)(l3 + sizeof(*ip6)))->check))
 			goto bad;
-		return octeon_ft_rx6(work, l2, l3, ip_off, n, vid[0], vid[1], sid);
+		ret = octeon_ft_rx6(work, l2, l3, ip_off, n, vid[0], vid[1], sid);
+		if (!ret)
+			goto bad;
+		return ret;
 	}
 	return 0;		/* LCP/IPCP/... -> pppd via the slow path */
 bad:
@@ -1083,8 +1133,11 @@ static int octeon_ft_rx(struct cvmx_wqe *work)
 	}
 
 	/* CN70XX may classify the inner IP; do not use not_IP as the only gate. */
-	if (!work->word2.snoip.rcv_error && atomic_read(&octeon_ft_ppp_rx_rules) &&
-	    (work->word2.snoip.not_IP || OCTEON_IS_MODEL(OCTEON_CN70XX))) {
+	if (!work->word2.snoip.rcv_error &&
+	    (work->word2.snoip.not_IP ||
+	     (OCTEON_IS_MODEL(OCTEON_CN70XX) &&
+	      (atomic_read(&octeon_ft_ppp_rx_rules) ||
+	       atomic_read(&octeon_ft_ppp_tx_rules))))) {
 		int ret = octeon_ft_rx_pppoe(work);
 
 		if (ret >= 0)
@@ -1473,6 +1526,8 @@ static bool octeon_ft_ppp_rule(struct octeon_ft_flow *flow,
 		memcpy(ppp->macs, tx->out.h_source, ETH_ALEN);
 		memcpy(ppp->macs + ETH_ALEN, tx->out.h_dest, ETH_ALEN);
 		atomic_inc(&octeon_ft_ppp_rx_rules);
+	} else {
+		atomic_inc(&octeon_ft_ppp_tx_rules);
 	}
 	return true;
 }
@@ -1515,7 +1570,7 @@ static struct octeon_ft_flow *octeon_ft_parse(struct flow_cls_offload *f)
 		return ERR_PTR(-ENOMEM);
 
 	flow->is_v6 = is_v6;
-	ppp = is_v6 ? &flow->key6.ppp : &flow->key.ppp;
+	ppp = &flow->ppp_key.session;
 	flow->cookie = f->cookie;
 	flow_rule_match_ports(rule, &ports);
 	if (is_v6) {
@@ -1707,6 +1762,14 @@ static struct octeon_ft_flow *octeon_ft_parse(struct flow_cls_offload *f)
 				flow->out_dev->ifindex, *kiif))
 		goto unsupported;
 
+	if (flow->ppp_ifindex) {
+		flow->ppp_key.is_v6 = is_v6;
+		if (is_v6)
+			memcpy(flow->ppp_key.tuple, &flow->key6, sizeof(flow->key6));
+		else
+			memcpy(flow->ppp_key.tuple, &flow->key, sizeof(flow->key));
+	}
+
 	/* The RX hook dereferences out_dev from softirq with only RCU pinning
 	 * the flow entry — pin the netdev itself for the flow's lifetime. The
 	 * ref is dropped in octeon_ft_flow_free (RCU-deferred on the data-path
@@ -1728,6 +1791,8 @@ static void octeon_ft_flow_free(struct octeon_ft_flow *flow)
 	if (flow->ppp_ifindex) {
 		if (!flow->eg_ppp)
 			atomic_dec(&octeon_ft_ppp_rx_rules);
+		else
+			atomic_dec(&octeon_ft_ppp_tx_rules);
 	}
 	dev_put(flow->out_dev);
 	kfree(flow);
@@ -1736,6 +1801,19 @@ static void octeon_ft_flow_free(struct octeon_ft_flow *flow)
 static void octeon_ft_flow_free_rcu(struct rcu_head *head)
 {
 	octeon_ft_flow_free(container_of(head, struct octeon_ft_flow, rcu));
+}
+
+static void octeon_ft_unlink_key(struct octeon_ft_flow *flow)
+{
+	if (flow->ppp_ifindex)
+		rhashtable_remove_fast(&octeon_ft_pppoe_table, &flow->node,
+				       octeon_ft_pppoe_params);
+	else if (flow->is_v6)
+		rhashtable_remove_fast(&octeon_ft_table6, &flow->node,
+				       octeon_ft_rht6_params);
+	else
+		rhashtable_remove_fast(&octeon_ft_table, &flow->node,
+				       octeon_ft_rht_params);
 }
 
 /* Remove a flow from all tables and free it (RCU-deferred: the RX hook may
@@ -1748,12 +1826,7 @@ static void octeon_ft_del(struct octeon_ft_flow *flow)
 	if (rhashtable_remove_fast(&octeon_ft_cookie_table, &flow->cookie_node,
 				   octeon_ft_cookie_params))
 		return;		/* lost the race; another path is freeing it */
-	if (flow->is_v6)
-		rhashtable_remove_fast(&octeon_ft_table6, &flow->node,
-				       octeon_ft_rht6_params);
-	else
-		rhashtable_remove_fast(&octeon_ft_table, &flow->node,
-				       octeon_ft_rht_params);
+	octeon_ft_unlink_key(flow);
 	atomic_dec(&octeon_ft_count);
 	call_rcu(&flow->rcu, octeon_ft_flow_free_rcu);
 }
@@ -1793,8 +1866,31 @@ static int octeon_ft_replace(struct flow_cls_offload *f)
 	 * token makes the double-evict race itself harmless.
 	 */
 	rcu_read_lock();
+	/* A reroute can change the egress encapsulation without changing the
+	 * plain ingress key. Evict its previous entry in the other table.
+	 */
+	if (flow->eg_ppp) {
+		if (flow->is_v6)
+			old = rhashtable_lookup(&octeon_ft_table6, &flow->key6,
+						 octeon_ft_rht6_params);
+		else
+			old = rhashtable_lookup(&octeon_ft_table, &flow->key,
+						 octeon_ft_rht_params);
+		if (old)
+			octeon_ft_del(old);
+	} else if (!flow->ppp_ifindex && atomic_read(&octeon_ft_ppp_tx_rules)) {
+		if (flow->is_v6)
+			old = octeon_ft_lookup_pppoe(&flow->key6, true, 0, 0, NULL);
+		else
+			old = octeon_ft_lookup_pppoe(&flow->key, false, 0, 0, NULL);
+		if (old)
+			octeon_ft_del(old);
+	}
 retry:
-	if (flow->is_v6)
+	if (flow->ppp_ifindex)
+		old = rhashtable_lookup_get_insert_fast(&octeon_ft_pppoe_table,
+				&flow->node, octeon_ft_pppoe_params);
+	else if (flow->is_v6)
 		old = rhashtable_lookup_get_insert_fast(&octeon_ft_table6,
 				&flow->node, octeon_ft_rht6_params);
 	else
@@ -1842,12 +1938,7 @@ retry:
 		 * may still hold it under rcu_read_lock. RCU-defer the free
 		 * (a plain kfree here is a use-after-free).
 		 */
-		if (flow->is_v6)
-			rhashtable_remove_fast(&octeon_ft_table6, &flow->node,
-					       octeon_ft_rht6_params);
-		else
-			rhashtable_remove_fast(&octeon_ft_table, &flow->node,
-					       octeon_ft_rht_params);
+		octeon_ft_unlink_key(flow);
 		call_rcu(&flow->rcu, octeon_ft_flow_free_rcu);
 		return err;
 	}
@@ -1930,7 +2021,7 @@ static int octeon_ft_destroy(struct flow_cls_offload *f)
 	return 0;
 }
 
-/* Drop every installed flow (all three tables). Used when the last flow block
+/* Drop every installed flow via the cookie index. Used when the last flow block
  * unbinds; octeon_ft_del() resolves races against concurrent DESTROYs.
  */
 static void octeon_ft_flush_all(void)
@@ -1998,13 +2089,17 @@ static int octeon_ft_setup_cb(enum tc_setup_type type, void *type_data,
 			      void *cb_priv)
 {
 	struct flow_cls_offload *f = type_data;
+	int ret;
 
 	if (type != TC_SETUP_CLSFLOWER)
 		return -EOPNOTSUPP;
 
 	switch (f->command) {
 	case FLOW_CLS_REPLACE:
-		return octeon_ft_replace(f);
+		mutex_lock(&octeon_ft_replace_lock);
+		ret = octeon_ft_replace(f);
+		mutex_unlock(&octeon_ft_replace_lock);
+		return ret;
 	case FLOW_CLS_DESTROY:
 		return octeon_ft_destroy(f);
 	case FLOW_CLS_STATS:
@@ -2079,6 +2174,13 @@ static int __init octeon_ft_init(void)
 {
 	int ret;
 
+	BUILD_BUG_ON(sizeof(struct octeon_ft_key) != 20);
+	BUILD_BUG_ON(sizeof(struct octeon_ft_key6) != 44);
+	BUILD_BUG_ON(sizeof(struct octeon_ft_pppoe_key) != 60);
+	BUILD_BUG_ON(__alignof__(struct octeon_ft_key) < sizeof(u32));
+	BUILD_BUG_ON(__alignof__(struct octeon_ft_key6) < sizeof(u32));
+	BUILD_BUG_ON(__alignof__(struct octeon_ft_pppoe_key) < sizeof(u32));
+
 	/* zero the global FAU counters (HW registers persist across reloads) */
 	cvmx_fau_atomic_write64(OCT_FT_FAU_BYTES, 0);
 	cvmx_fau_atomic_write64(OCT_FT_FAU_PKTS, 0);
@@ -2091,8 +2193,15 @@ static int __init octeon_ft_init(void)
 		rhashtable_destroy(&octeon_ft_table);
 		return ret;
 	}
+	ret = rhashtable_init(&octeon_ft_pppoe_table, &octeon_ft_pppoe_params);
+	if (ret) {
+		rhashtable_destroy(&octeon_ft_table6);
+		rhashtable_destroy(&octeon_ft_table);
+		return ret;
+	}
 	ret = rhashtable_init(&octeon_ft_cookie_table, &octeon_ft_cookie_params);
 	if (ret) {
+		rhashtable_destroy(&octeon_ft_pppoe_table);
 		rhashtable_destroy(&octeon_ft_table6);
 		rhashtable_destroy(&octeon_ft_table);
 		return ret;
@@ -2101,6 +2210,7 @@ static int __init octeon_ft_init(void)
 	ret = flow_indr_dev_register(octeon_ft_indr_setup, NULL);
 	if (ret) {
 		rhashtable_destroy(&octeon_ft_cookie_table);
+		rhashtable_destroy(&octeon_ft_pppoe_table);
 		rhashtable_destroy(&octeon_ft_table6);
 		rhashtable_destroy(&octeon_ft_table);
 		return ret;
@@ -2129,6 +2239,7 @@ static void __exit octeon_ft_exit(void)
 	 * is unmapped. */
 	rcu_barrier();
 	rhashtable_destroy(&octeon_ft_cookie_table);
+	rhashtable_free_and_destroy(&octeon_ft_pppoe_table, octeon_ft_free_flow, NULL);
 	rhashtable_free_and_destroy(&octeon_ft_table6, octeon_ft_free_flow, NULL);
 	rhashtable_free_and_destroy(&octeon_ft_table, octeon_ft_free_flow, NULL);
 	pr_info(DRV_NAME ": unloaded\n");

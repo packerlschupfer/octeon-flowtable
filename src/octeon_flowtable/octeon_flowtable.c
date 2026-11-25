@@ -243,7 +243,15 @@ static inline void octeon_ft_ppp_key_rx(struct octeon_ft_ppp_key *key,
 	memcpy(key->macs, l2, sizeof(key->macs));
 }
 
-/* Keep rhashtable keys word-sized and aligned for jhash2 on MIPS. */
+/*
+ * Flow keys are rhashtable keys. Keep each key a multiple of 4 bytes and
+ * 4-byte aligned: rhashtable then hashes it with jhash2() word by word. Any
+ * other length falls back to byte-wise jhash() for every lookup (a measured
+ * ~15% single-stream loss), and an unaligned key would make jhash2() take
+ * unaligned-access traps on MIPS. __aligned(4) rounds sizeof up to a multiple
+ * of 4; the padding is zero because keys are always memset/kzalloc'ed.
+ * octeon_ft_init() enforces this at build time.
+ */
 struct octeon_ft_key {
 	__be32	saddr;
 	__be32	daddr;

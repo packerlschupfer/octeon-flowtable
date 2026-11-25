@@ -1,8 +1,34 @@
 # Future work — octeon_flowtable beyond the met metric
 
-*2026-06-04. The driver meets all success metrics and matches the vendor (see
-docs/PROJECT-OUTCOME.md). These are the remaining items, each with enough design
-to implement. None blocks the metric; ordered by value for the gw use case.*
+*Written 2026-06-04 as the to-do list after the driver met its success metrics
+(see docs/PROJECT-OUTCOME.md). All six items below are done; their sections are
+kept as the design and measurement record. Updated 2026-11-24.*
+
+## Open items (2026-11)
+- **QoS for offloaded traffic** (CAKE/HTB with a hand-off into the Linux queues):
+  contributor work in progress, see issue #11. Must be off by default and leave
+  the offload unchanged when disabled.
+- **Native LuCI view for the traffic page**: today `luci-app-trafficd` embeds
+  `/traffic/` in a frame. A contributor offered a proper view.
+- **Successor Ethernet driver**: OpenWrt PR #26060 (`octeon_pip`) would replace
+  the staging driver that patch 120 hooks into. When it lands, the hooks need
+  porting (or an XDP-based design).
+- **Crypto offload**: a separate project, see `docs/COP2-CRYPTO-SCOPING.md`.
+
+## Done since June, beyond this list
+- PPPoE encap/decap in the fast path, including PPPoE over VLAN (v0.2.0).
+- Optional DPI (`flowclassd`, nDPI) and the traffic page (`trafficd`), the `dpi`
+  image variant (v0.3.0), and the LuCI menu entry (v0.4.0).
+- A security hardening pass of the module (in every release since v0.1.0).
+- Kernel 6.18.60 base (OpenWrt `382a2109`, v0.4.0 and v0.4.2).
+- Multi-flow VLAN throughput re-measured on a proper NIC (see section 1).
+- IPv6 over PPPoE bench-tested (2026-11-24, kernel 6.18.60, PPPoE server on
+  the WAN cable, MTU 1492): 905-916 Mbps up and down, single stream and -P4,
+  `[HW_OFFLOAD]`, `tx_fail` 0. IPv4 over the same session 902-917. A
+  1500-byte IPv6 packet gets "Packet Too Big, mtu 1492" from the router and a
+  1492-byte one passes, so PMTUD works.
+- All three v0.4.2 images boot-tested on hardware: `lean` 931-935 Mbps, `router`
+  928-932 (LuCI login works), `dpi` 916-932; 5-minute soaks without errors.
 
 ## Done since M2
 - ✅ Per-flow stats → `conntrack -L` visibility + keep-alive (`octeon_ft_stats`).
@@ -77,9 +103,8 @@ did not corrupt the FPA pool), and unloads cleanly:
   mis-offloads the TCP checksum past two tags — a rig quirk, not the driver).
 - Untagged NAT still line-rate `[HW_OFFLOAD]` (936 Mbps, no regression).
 - Rigs: `tests/{ftvlan.nft,ftpp.nft,ftqq.nft,bench-vlan-rig.sh,dock-vlan-rig.sh}`.
-NOTE: multi-flow throughput is **rig-limited** (test endpoints share one USB NIC;
-the gw's switch would distribute VLANs across many client ports) — not a driver
-limit.
+Multi-flow throughput was rig-limited by the USB test NIC at the time; with a
+proper NIC it is line rate (see "Still TODO for VLANs" below).
 
 ### Still TODO for VLANs
 - **3+ stacked tags — NOT offloadable (hardware limit, verified).** The CN50xx
@@ -89,19 +114,16 @@ limit.
   PIP by hand in the WQE hook — defeating the point of the HW-classified fast
   path. The gw has no QinQ at all, let alone triple tags. So this is closed:
   correct behavior, not a missing feature.
-- **Multi-flow VLAN throughput — resolved as a bench-NIC limit, not a driver
-  limit.** Measured: two-NIC push/pop (tagged client on the dock, untagged server
-  on eno1, no hairpin) = **742 Mbps -P4**; router-on-a-stick retag (both endpoints
-  on the one dock NIC) = 233 Mbps (single-NIC hairpin). For reference the *same*
-  dock NIC carried **935–941 Mbps** as the RX/server side in the original non-VLAN
-  benchmark, and the VLAN xform adds only a cheap in-buffer byte-shift (no
-  checksum) — so the driver does line rate; the bench's RTL8153 USB NIC caps VLAN
-  multi-flow (~740–800 Mbps as the tagged TX client). True line-rate VLAN
-  multi-flow needs the gw's real topology (a switch trunk feeding many client
-  ports). The only tag-transparent bench port is eth2 (direct cable to the dock);
-  eth1↔eno1 runs through the VLAN-aware D-Link switch (tagged frames are filtered
-  unless that switch is configured to trunk the VLAN — not done, it carries the
-  bench management network). Closed: the driver is proven; the number is rig-bound.
+- **Multi-flow VLAN throughput — line rate (measured 2026-11-24).** The June
+  numbers (742 Mbps push/pop, 233 Mbps retag) were limited by the bench's
+  RTL8153 USB NIC. Re-measured with an Intel I340 port cabled straight to eth2
+  (kernel 6.18.60, hardware offload on, VLAN subinterfaces eth2.36/eth2.37 in
+  the LAN zone, 10 s iperf3 runs, both directions):
+  - push/pop with NAT (VLAN 36 tagged ↔ untagged WAN): **905–929 Mbps**, single
+    stream and -P4;
+  - retag, router-on-a-stick (VLAN 36 ↔ VLAN 37 on the same cable):
+    **896–921 Mbps**, single stream and -P4.
+  All flows `[HW_OFFLOAD]`, `tx_fail` 0. Closed: VLAN flows run at line rate.
 
 ## 2. IPv6 flows  ✅ DONE (2026-06-04)
 IPv6 routing is **implemented and verified on hardware** — and it turned out
@@ -251,7 +273,7 @@ a later `flow_indr_dev_unregister()` (module unload) walks freed memory in
 remove also does `list_del(&block_cb->indr.list)`. Matches ice/mlx5/sfc. One
 line in `octeon_ft_indr_setup`.
 
-How it was found (for next time): the bench has no serial/pstore/netconsole, so
+How it was found (for next time): the bench had no serial console at the time (it has one now), so
 set `panic_on_oops=0` — a *survivable* oops then leaves the box up with the full
 trace in `dmesg` instead of rebooting. Bisected with markers: `insmod`→`rmmod`
 with no bind is clean; the crash needs a bind. NB: an oops inside `module_exit`

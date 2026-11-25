@@ -226,6 +226,15 @@ static inline void octeon_ft_aqm_unreserve(u8 eport, u32 bytes)
 
 /* ---- flow table ---- */
 
+/*
+ * Flow keys are rhashtable keys. Keep each key a multiple of 4 bytes and
+ * 4-byte aligned: rhashtable then hashes it with jhash2() word by word. Any
+ * other length falls back to byte-wise jhash() for every lookup (a measured
+ * ~15% single-stream loss), and an unaligned key would make jhash2() take
+ * unaligned-access traps on MIPS. __aligned(4) rounds sizeof up to a multiple
+ * of 4; the padding is zero because keys are always memset/kzalloc'ed.
+ * octeon_ft_init() enforces this at build time.
+ */
 struct octeon_ft_key {
 	__be32	saddr;
 	__be32	daddr;
@@ -240,7 +249,7 @@ struct octeon_ft_key {
 	u16	iif_port;	/* ingress octeon PIP port — disambiguates the
 				 * same 5-tuple+VLAN on different physical ports
 				 * (multi-homing / policy routing). */
-} __packed;
+} __packed __aligned(4);
 
 /* IPv6 5-tuple key (separate table; v6 is routed, never NAT'd, so no rewrite of
  * the addresses/ports — only MAC + hop limit change). */
@@ -254,7 +263,7 @@ struct octeon_ft_key6 {
 	u16		vlan_id;
 	u16		vlan_id2;
 	u16		iif_port;	/* ingress octeon PIP port (see v4 key) */
-} __packed;
+} __packed __aligned(4);
 
 /*
  * The decoded rewrite. We do NOT replay the flowtable's raw MANGLE words: those
@@ -1923,6 +1932,9 @@ static int octeon_ft_indr_setup(struct net_device *dev, struct Qdisc *sch,
 static int __init octeon_ft_init(void)
 {
 	int ret;
+
+	BUILD_BUG_ON(sizeof(struct octeon_ft_key) % sizeof(u32));
+	BUILD_BUG_ON(sizeof(struct octeon_ft_key6) % sizeof(u32));
 
 	/* zero the global FAU counters (HW registers persist across reloads) */
 	cvmx_fau_atomic_write64(OCT_FT_FAU_BYTES, 0);

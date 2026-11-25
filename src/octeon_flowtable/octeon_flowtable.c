@@ -317,7 +317,7 @@ struct octeon_ft_flow {
 	u8			eport;		/* egress octeon port (AQM counter idx) */
 	u16			eg_vid[2];	/* wire order: [0]=outer, [1]=inner */
 	/* Egress PPPoE session and logical endpoint (held until flow free). */
-	struct net_device	*ppp_dev;
+	u32			ppp_ifindex;
 	u64			ppp_generation;
 	u8			ppp_port;
 	bool			eg_ppp;
@@ -482,18 +482,27 @@ static bool octeon_ft_ppp_family(void)
 	return OCTEON_IS_MODEL(OCTEON_CN50XX) || OCTEON_IS_MODEL(OCTEON_CN70XX);
 }
 
+static struct net_device *octeon_ft_ppp_dev(const struct octeon_ft_flow *flow)
+{
+	if (!flow->ppp_ifindex)
+		return NULL;
+	return dev_get_by_index_rcu(dev_net(flow->out_dev), flow->ppp_ifindex);
+}
+
 static bool octeon_ft_mtu_ok(const struct octeon_ft_flow *flow, int tags,
 			    unsigned int ip_len, unsigned int available)
 {
-	if (!flow->ppp_dev)
+	const struct net_device *ppp_dev = octeon_ft_ppp_dev(flow);
+
+	if (!flow->ppp_ifindex)
 		return available <= flow->mtu;
-	if (flow->ppp_generation !=
+	if (!ppp_dev || flow->ppp_generation !=
 	    atomic64_read(&octeon_ft_ppp_generation[flow->ppp_port]) ||
-	    !netif_running(flow->out_dev) || !netif_running(flow->ppp_dev) ||
+	    !netif_running(flow->out_dev) || !netif_running(ppp_dev) ||
 	    tags != flow->ppp_in_tags || ip_len > available || ip_len > flow->mtu)
 		return false;
 	if (flow->eg_ppp)
-		return ip_len <= READ_ONCE(flow->ppp_dev->mtu) &&
+		return ip_len <= READ_ONCE(ppp_dev->mtu) &&
 		       ip_len + OCT_PPPOE_HLEN <= READ_ONCE(flow->out_dev->mtu);
 	return ip_len <= READ_ONCE(flow->out_dev->mtu);
 }
@@ -634,7 +643,7 @@ static int octeon_ft_rx6(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 		key.vlan_id2 = 0;
 		flow = rhashtable_lookup(&octeon_ft_table6, &key,
 					 octeon_ft_rht6_params);
-		if (flow && flow->ppp_dev)
+		if (flow && flow->ppp_ifindex)
 			flow = NULL;
 	}
 	if (!flow) {
@@ -664,7 +673,7 @@ static int octeon_ft_rx6(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 
 	atomic_inc(&octeon_ft_hits);
 	od = flow->out_dev;
-	if (flow->ppp_dev)
+	if (flow->ppp_ifindex)
 		work->word1.len = ip_off + ip_len;
 	octeon_ft_l2_xform(work, l2, n_ig, ig_ppp, flow, true, ip_len);
 	fb = work->word1.len;
@@ -764,7 +773,7 @@ static int octeon_ft_fwd4(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 		key.vlan_id2 = 0;
 		flow = rhashtable_lookup(&octeon_ft_table, &key,
 					 octeon_ft_rht_params);
-		if (flow && flow->ppp_dev)
+		if (flow && flow->ppp_ifindex)
 			flow = NULL;
 	}
 	if (!flow) {
@@ -854,7 +863,7 @@ static int octeon_ft_fwd4(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 		 * push / QinQ, any combination). The tags are not covered by the
 		 * IP/L4 checksums, so this never touches the checksums.
 		 */
-		if (flow->ppp_dev)
+		if (flow->ppp_ifindex)
 			work->word1.len = ip_off + ip_len;
 		octeon_ft_l2_xform(work, l2, n_ig, ig_ppp, flow, false, ip_len);
 		fb = work->word1.len;	/* egress length (post tag xform) */
@@ -1400,6 +1409,7 @@ static bool octeon_ft_ppp_rule(struct octeon_ft_flow *flow,
 	const struct flow_offload_tuple *other, *tx;
 	const struct flow_offload *nf;
 	u16 in_vid[2] = {}, out_vid[2] = {}, in_sid = 0, out_sid = 0;
+	struct net_device *ppp_dev;
 	unsigned int port;
 	int in_tags, out_tags, dir;
 
@@ -1444,14 +1454,15 @@ static bool octeon_ft_ppp_rule(struct octeon_ft_flow *flow,
 	flow->ppp_port = port;
 	flow->ppp_generation = atomic64_read(&octeon_ft_ppp_generation[port]);
 
-	flow->ppp_dev = dev_get_by_index(dev_net(flow->out_dev), tx->out.ifidx);
-	if (!flow->ppp_dev)
+	ppp_dev = dev_get_by_index(dev_net(flow->out_dev), tx->out.ifidx);
+	if (!ppp_dev)
 		return false;
-	if (flow->ppp_dev->type != ARPHRD_PPP || !netif_running(flow->ppp_dev)) {
-		dev_put(flow->ppp_dev);
-		flow->ppp_dev = NULL;
+	if (ppp_dev->type != ARPHRD_PPP || !netif_running(ppp_dev)) {
+		dev_put(ppp_dev);
 		return false;
 	}
+	flow->ppp_ifindex = ppp_dev->ifindex;
+	dev_put(ppp_dev);
 	flow->ppp_in_tags = in_tags;
 	flow->mtu = tuple->mtu;
 	*vid0 = in_vid[0];
@@ -1714,10 +1725,9 @@ unsupported:
  */
 static void octeon_ft_flow_free(struct octeon_ft_flow *flow)
 {
-	if (flow->ppp_dev) {
+	if (flow->ppp_ifindex) {
 		if (!flow->eg_ppp)
 			atomic_dec(&octeon_ft_ppp_rx_rules);
-		dev_put(flow->ppp_dev);
 	}
 	dev_put(flow->out_dev);
 	kfree(flow);

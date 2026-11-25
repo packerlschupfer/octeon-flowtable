@@ -509,20 +509,13 @@ static bool octeon_ft_ppp_family(void)
 	return OCTEON_IS_MODEL(OCTEON_CN50XX) || OCTEON_IS_MODEL(OCTEON_CN70XX);
 }
 
-static struct net_device *octeon_ft_ppp_dev(const struct octeon_ft_flow *flow)
+/* Only PPPoE flows need a live logical device and session checks. */
+static bool octeon_ft_pppoe_mtu_ok(const struct octeon_ft_flow *flow, int tags,
+				  unsigned int ip_len, unsigned int available)
 {
-	if (!flow->ppp_ifindex)
-		return NULL;
-	return dev_get_by_index_rcu(dev_net(flow->out_dev), flow->ppp_ifindex);
-}
+	const struct net_device *ppp_dev;
 
-static bool octeon_ft_mtu_ok(const struct octeon_ft_flow *flow, int tags,
-			    unsigned int ip_len, unsigned int available)
-{
-	const struct net_device *ppp_dev = octeon_ft_ppp_dev(flow);
-
-	if (!flow->ppp_ifindex)
-		return available <= flow->mtu;
+	ppp_dev = dev_get_by_index_rcu(dev_net(flow->out_dev), flow->ppp_ifindex);
 	if (!ppp_dev || flow->ppp_generation !=
 	    atomic64_read(&octeon_ft_ppp_generation[flow->ppp_port]) ||
 	    !netif_running(flow->out_dev) || !netif_running(ppp_dev) ||
@@ -700,7 +693,9 @@ static int octeon_ft_rx6(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 		return 0;
 	}
 	/* Oversize for the egress MTU -> slow path (ICMPv6 packet-too-big). */
-	if (!octeon_ft_mtu_ok(flow, n_ig, ip_len, work->word1.len - ip_off)) {
+	if (flow->ppp_ifindex ?
+	    !octeon_ft_pppoe_mtu_ok(flow, n_ig, ip_len, work->word1.len - ip_off) :
+	    work->word1.len - ip_off > flow->mtu) {
 		rcu_read_unlock();
 		return 0;
 	}
@@ -839,7 +834,9 @@ static int octeon_ft_fwd4(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 	 * length is len - ip_off (egress tag changes don't alter it). Matches
 	 * nf_flow_offload_ip_hook's nf_flow_exceeds_mtu punt.
 	 */
-	if (!octeon_ft_mtu_ok(flow, n_ig, ip_len, work->word1.len - ip_off)) {
+	if (flow->ppp_ifindex ?
+	    !octeon_ft_pppoe_mtu_ok(flow, n_ig, ip_len, work->word1.len - ip_off) :
+	    work->word1.len - ip_off > flow->mtu) {
 		rcu_read_unlock();
 		return 0;
 	}

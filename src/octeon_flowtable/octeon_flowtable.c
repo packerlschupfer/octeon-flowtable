@@ -503,11 +503,8 @@ static atomic_t octeon_ft_ppp_rx_rules = ATOMIC_INIT(0);
 module_param_cb(pppoe_ingress_flows, &octeon_ft_atomic_ops, &octeon_ft_ppp_rx_rules, 0444);
 MODULE_PARM_DESC(pppoe_ingress_flows, "referenced PPPoE ingress rules");
 
-static bool octeon_ft_ppp_family(void)
-{
-	/* CN71XX is an alias of CN70XX in the kernel model definitions. */
-	return OCTEON_IS_MODEL(OCTEON_CN50XX) || OCTEON_IS_MODEL(OCTEON_CN70XX);
-}
+/* CN71XX is an alias of CN70XX in the kernel model definitions. */
+static bool octeon_ft_cn70xx __read_mostly;
 
 /* Only PPPoE flows need a live logical device and session checks. */
 static bool octeon_ft_pppoe_mtu_ok(const struct octeon_ft_flow *flow, int tags,
@@ -1140,7 +1137,7 @@ static int octeon_ft_rx(struct cvmx_wqe *work)
 	/* CN70XX may classify the inner IP; do not use not_IP as the only gate. */
 	if (!work->word2.snoip.rcv_error &&
 	    (work->word2.snoip.not_IP ||
-	     (OCTEON_IS_MODEL(OCTEON_CN70XX) &&
+	     (octeon_ft_cn70xx &&
 	      (atomic_read(&octeon_ft_ppp_rx_rules) ||
 	       atomic_read(&octeon_ft_ppp_tx_rules))))) {
 		int ret = octeon_ft_rx_pppoe(work);
@@ -1475,8 +1472,6 @@ static bool octeon_ft_ppp_rule(struct octeon_ft_flow *flow,
 		return false;
 	if (!octeon_ft_has_pppoe(tuple) && !flow->eg_ppp)
 		return true;
-	if (!octeon_ft_ppp_family())
-		return false;
 	dir = tuple->dir;
 	if (dir >= FLOW_OFFLOAD_DIR_MAX)
 		return false;
@@ -2185,6 +2180,8 @@ static int __init octeon_ft_init(void)
 	BUILD_BUG_ON(__alignof__(struct octeon_ft_key) < sizeof(u32));
 	BUILD_BUG_ON(__alignof__(struct octeon_ft_key6) < sizeof(u32));
 	BUILD_BUG_ON(__alignof__(struct octeon_ft_pppoe_key) < sizeof(u32));
+
+	octeon_ft_cn70xx = OCTEON_IS_MODEL(OCTEON_CN70XX);
 
 	/* zero the global FAU counters (HW registers persist across reloads) */
 	cvmx_fau_atomic_write64(OCT_FT_FAU_BYTES, 0);

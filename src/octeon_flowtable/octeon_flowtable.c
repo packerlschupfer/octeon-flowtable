@@ -291,6 +291,14 @@ struct octeon_ft_pppoe_key {
 	u8 is_v6;
 } __packed __aligned(4);
 
+/* Diagnostic index, consulted only after a PPPoE ingress flow miss. */
+struct octeon_ft_ppp_link {
+	u16 port;
+	u16 vid[2];
+	u8 tags;
+	u8 pad;
+} __packed __aligned(4);
+
 /*
  * The decoded rewrite. We do NOT replay the flowtable's raw MANGLE words: those
  * are host-endian u32s encoded for little-endian HW-offload consumers (mlx5 &c.)
@@ -315,6 +323,8 @@ struct octeon_ft_flow {
 	struct octeon_ft_key	key;		/* used when !is_v6 */
 	struct octeon_ft_key6	key6;		/* used when is_v6 */
 	struct octeon_ft_pppoe_key ppp_key;
+	struct octeon_ft_ppp_link ppp_link;
+	struct rhlist_head ppp_link_node;
 	bool			is_v6;
 	unsigned long		cookie;
 	struct net_device	*out_dev;	/* physical octeon port for PKO;
@@ -387,6 +397,12 @@ static const struct rhashtable_params octeon_ft_cookie_params = {
 static struct rhashtable octeon_ft_table;
 static struct rhashtable octeon_ft_table6;
 static struct rhashtable octeon_ft_pppoe_table;
+static struct rhltable octeon_ft_ppp_links;
+static const struct rhashtable_params octeon_ft_ppp_link_params = {
+	.head_offset = offsetof(struct octeon_ft_flow, ppp_link_node),
+	.key_offset = offsetof(struct octeon_ft_flow, ppp_link),
+	.key_len = sizeof(struct octeon_ft_ppp_link),
+};
 static atomic_t octeon_ft_ppp_tx_rules = ATOMIC_INIT(0);
 /* Serialize REPLACE across the plain and PPPoE tables, not RX lookups. */
 static DEFINE_MUTEX(octeon_ft_replace_lock);
@@ -424,6 +440,7 @@ static atomic_t octeon_ft_r_ipoff = ATOMIC_INIT(0);
 static atomic_t octeon_ft_r_ctl = ATOMIC_INIT(0);
 static atomic_t octeon_ft_r_miss = ATOMIC_INIT(0);
 static atomic_t octeon_ft_r_ppp = ATOMIC_INIT(0);
+static atomic_t octeon_ft_r_ppp_miss = ATOMIC_INIT(0);
 module_param_cb(r_bufs, &octeon_ft_atomic_ops, &octeon_ft_r_bufs, 0444);
 MODULE_PARM_DESC(r_bufs, "rejects: multi-buffer WQE");
 module_param_cb(r_wqe, &octeon_ft_atomic_ops, &octeon_ft_r_wqe, 0444);
@@ -435,7 +452,9 @@ MODULE_PARM_DESC(r_ctl, "rejects: TCP syn/fin/rst punted");
 module_param_cb(r_miss, &octeon_ft_atomic_ops, &octeon_ft_r_miss, 0444);
 MODULE_PARM_DESC(r_miss, "rejects: flow table lookup miss");
 module_param_cb(r_ppp, &octeon_ft_atomic_ops, &octeon_ft_r_ppp, 0444);
-MODULE_PARM_DESC(r_ppp, "rejects: PPPoE frame missed or failed validation");
+MODULE_PARM_DESC(r_ppp, "rejects: invalid PPPoE data or conflicting learned session");
+module_param_cb(r_ppp_miss, &octeon_ft_atomic_ops, &octeon_ft_r_ppp_miss, 0444);
+MODULE_PARM_DESC(r_ppp_miss, "PPPoE ingress lookup misses without a confirmed session conflict");
 
 /* ============================ data path ============================ */
 
@@ -631,6 +650,47 @@ octeon_ft_lookup_pppoe(const void *tuple, bool is_v6, u16 sid, u8 tags,
 				 octeon_ft_pppoe_params);
 }
 
+/* Called under RCU on exact flow misses only. A learned exact session wins
+ * over conflicting candidates on the same link. With no identity evidence
+ * (or if the bounded walk cannot decide), report a miss, not a rejection.
+ */
+static noinline void octeon_ft_ppp_miss(u16 port, u16 vid0, u16 vid1,
+				       u8 tags, u16 sid, const u8 *l2)
+{
+	struct octeon_ft_ppp_link key = { .port = port, .vid = { vid0, vid1 },
+					 .tags = tags };
+	struct rhlist_head *list, *pos;
+	const struct octeon_ft_flow *flow;
+	bool conflict = false;
+	unsigned int budget = 32;
+	u64 generation;
+
+	if (port >= ARRAY_SIZE(octeon_ft_ppp_generation))
+		goto miss;
+	generation = atomic64_read(&octeon_ft_ppp_generation[port]);
+	list = rhltable_lookup(&octeon_ft_ppp_links, &key,
+			      octeon_ft_ppp_link_params);
+	rhl_for_each_entry_rcu(flow, pos, list, ppp_link_node) {
+		bool same_sid, same_macs;
+
+		if (!budget--)
+			goto miss;
+		if (flow->ppp_generation != generation)
+			continue;
+		same_sid = flow->ppp_key.session.sid == sid;
+		same_macs = !memcmp(flow->ppp_key.session.macs, l2, 2 * ETH_ALEN);
+		if (same_sid && same_macs)
+			goto miss;
+		conflict |= same_sid || same_macs;
+	}
+	if (conflict) {
+		atomic_inc(&octeon_ft_r_ppp);
+		return;
+	}
+miss:
+	atomic_inc(&octeon_ft_r_ppp_miss);
+}
+
 static int octeon_ft_rx6(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 			 int n_ig, u16 vid0, u16 vid1, u16 sid)
 {
@@ -682,6 +742,8 @@ static int octeon_ft_rx6(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 					 octeon_ft_rht6_params);
 	}
 	if (!flow) {
+		if (ig_ppp)
+			octeon_ft_ppp_miss(key.iif_port, vid0, vid1, n_ig, sid, l2);
 		rcu_read_unlock();
 		return 0;
 	}
@@ -816,7 +878,10 @@ static int octeon_ft_fwd4(struct cvmx_wqe *work, u8 *l2, u8 *l3, int ip_off,
 					 octeon_ft_rht_params);
 	}
 	if (!flow) {
-		atomic_inc(&octeon_ft_r_miss);
+		if (ig_ppp)
+			octeon_ft_ppp_miss(key.iif_port, vid0, vid1, n_ig, sid, l2);
+		else
+			atomic_inc(&octeon_ft_r_miss);
 		rcu_read_unlock();
 		return 0;	/* miss -> slow path */
 	}
@@ -971,7 +1036,7 @@ static int octeon_ft_rx_pppoe(struct cvmx_wqe *work)
 	u8 *l2 = octeon_ft_pkt_data(work), *ph, *l3;
 	unsigned int len = work->word1.len, off = 2 * ETH_ALEN, avail, plen;
 	u16 vid[2] = { 0, 0 }, et, proto, sid;
-	int n = 0, ip_off, ret;
+	int n = 0, ip_off;
 
 	if (len < off + 2)
 		return 0;
@@ -1020,10 +1085,7 @@ static int octeon_ft_rx_pppoe(struct cvmx_wqe *work)
 		if (unlikely(octeon_ft_ppp_wqe_csum_error(work)) ||
 		    !octeon_ft_ppp_l4_ok(l3 + ihl, tot - ihl, iph->protocol))
 			goto bad;
-		ret = octeon_ft_fwd4(work, l2, l3, ip_off, n, vid[0], vid[1], sid);
-		if (!ret)
-			goto bad;
-		return ret;
+		return octeon_ft_fwd4(work, l2, l3, ip_off, n, vid[0], vid[1], sid);
 	}
 	if (proto == OCT_PPP_IPV6) {
 		struct ipv6hdr *ip6 = (struct ipv6hdr *)l3;
@@ -1041,10 +1103,7 @@ static int octeon_ft_rx_pppoe(struct cvmx_wqe *work)
 		    (ip6->nexthdr == IPPROTO_UDP &&
 		     !((const struct udphdr *)(l3 + sizeof(*ip6)))->check))
 			goto bad;
-		ret = octeon_ft_rx6(work, l2, l3, ip_off, n, vid[0], vid[1], sid);
-		if (!ret)
-			goto bad;
-		return ret;
+		return octeon_ft_rx6(work, l2, l3, ip_off, n, vid[0], vid[1], sid);
 	}
 	return 0;		/* LCP/IPCP/... -> pppd via the slow path */
 bad:
@@ -1763,6 +1822,10 @@ static struct octeon_ft_flow *octeon_ft_parse(struct flow_cls_offload *f)
 		goto unsupported;
 
 	if (flow->ppp_ifindex) {
+		flow->ppp_link.port = *kiif;
+		flow->ppp_link.vid[0] = *kvid;
+		flow->ppp_link.vid[1] = *kvid2;
+		flow->ppp_link.tags = ppp->tags;
 		flow->ppp_key.is_v6 = is_v6;
 		if (is_v6)
 			memcpy(flow->ppp_key.tuple, &flow->key6, sizeof(flow->key6));
@@ -1826,6 +1889,9 @@ static void octeon_ft_del(struct octeon_ft_flow *flow)
 	if (rhashtable_remove_fast(&octeon_ft_cookie_table, &flow->cookie_node,
 				   octeon_ft_cookie_params))
 		return;		/* lost the race; another path is freeing it */
+	if (flow->ppp_key.session.sid)
+		rhltable_remove(&octeon_ft_ppp_links, &flow->ppp_link_node,
+			       octeon_ft_ppp_link_params);
 	octeon_ft_unlink_key(flow);
 	atomic_dec(&octeon_ft_count);
 	call_rcu(&flow->rcu, octeon_ft_flow_free_rcu);
@@ -1912,6 +1978,16 @@ retry:
 		octeon_ft_del(old);
 		goto retry;
 	}
+	if (flow->ppp_key.session.sid) {
+		err = rhltable_insert(&octeon_ft_ppp_links, &flow->ppp_link_node,
+				      octeon_ft_ppp_link_params);
+		if (err) {
+			rcu_read_unlock();
+			octeon_ft_unlink_key(flow);
+			call_rcu(&flow->rcu, octeon_ft_flow_free_rcu);
+			return err;
+		}
+	}
 	err = rhashtable_lookup_insert_fast(&octeon_ft_cookie_table,
 					    &flow->cookie_node,
 					    octeon_ft_cookie_params);
@@ -1938,6 +2014,9 @@ retry:
 		 * may still hold it under rcu_read_lock. RCU-defer the free
 		 * (a plain kfree here is a use-after-free).
 		 */
+		if (flow->ppp_key.session.sid)
+			rhltable_remove(&octeon_ft_ppp_links, &flow->ppp_link_node,
+				       octeon_ft_ppp_link_params);
 		octeon_ft_unlink_key(flow);
 		call_rcu(&flow->rcu, octeon_ft_flow_free_rcu);
 		return err;
@@ -2201,8 +2280,16 @@ static int __init octeon_ft_init(void)
 		rhashtable_destroy(&octeon_ft_table);
 		return ret;
 	}
+	ret = rhltable_init(&octeon_ft_ppp_links, &octeon_ft_ppp_link_params);
+	if (ret) {
+		rhashtable_destroy(&octeon_ft_pppoe_table);
+		rhashtable_destroy(&octeon_ft_table6);
+		rhashtable_destroy(&octeon_ft_table);
+		return ret;
+	}
 	ret = rhashtable_init(&octeon_ft_cookie_table, &octeon_ft_cookie_params);
 	if (ret) {
+		rhltable_destroy(&octeon_ft_ppp_links);
 		rhashtable_destroy(&octeon_ft_pppoe_table);
 		rhashtable_destroy(&octeon_ft_table6);
 		rhashtable_destroy(&octeon_ft_table);
@@ -2212,6 +2299,7 @@ static int __init octeon_ft_init(void)
 	ret = flow_indr_dev_register(octeon_ft_indr_setup, NULL);
 	if (ret) {
 		rhashtable_destroy(&octeon_ft_cookie_table);
+		rhltable_destroy(&octeon_ft_ppp_links);
 		rhashtable_destroy(&octeon_ft_pppoe_table);
 		rhashtable_destroy(&octeon_ft_table6);
 		rhashtable_destroy(&octeon_ft_table);
@@ -2241,6 +2329,7 @@ static void __exit octeon_ft_exit(void)
 	 * is unmapped. */
 	rcu_barrier();
 	rhashtable_destroy(&octeon_ft_cookie_table);
+	rhltable_destroy(&octeon_ft_ppp_links);
 	rhashtable_free_and_destroy(&octeon_ft_pppoe_table, octeon_ft_free_flow, NULL);
 	rhashtable_free_and_destroy(&octeon_ft_table6, octeon_ft_free_flow, NULL);
 	rhashtable_free_and_destroy(&octeon_ft_table, octeon_ft_free_flow, NULL);

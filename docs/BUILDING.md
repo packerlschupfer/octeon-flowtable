@@ -60,6 +60,12 @@ GRPTAG hash-steering — the lever that gets multi-flow forwarding to line rate)
 For a packaged image add it to `ERLITE_CMDLINE` in
 `target/linux/octeon/image/Makefile`; on a USB/U-Boot setup put it in `bootcmd`.
 
+Leave OpenWrt's packet steering (RPS) off. With the receive groups already
+spread across both cores, RPS steers every slow-path packet to CPU0; on an
+ERLite that measured ~2190 vs ~2970 new TCP connections/s through NAT. The
+`kmod-octeon-flowtable` package sets `network.globals.packet_steering=0` on
+first boot unless you have set the option yourself.
+
 ## 4. Add the module package
 
 ```sh

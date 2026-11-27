@@ -1,0 +1,13 @@
+#!/bin/sh
+# Packet steering off by default on the ERLite.
+# octeon_ethernet already spreads receive work across both cores in hardware
+# (receive_group_order=1). OpenWrt's packet steering adds RPS on top, which on
+# this board steers every slow-path packet to CPU0: measured ~2190 vs ~2970 new
+# TCP connections/s through NAT, offloaded throughput unchanged.
+# An explicit user setting is kept.
+
+[ -n "$(uci -q get network.globals.packet_steering)" ] && exit 0
+uci -q get network.globals >/dev/null || uci set network.globals=globals
+uci set network.globals.packet_steering='0'
+uci commit network
+exit 0

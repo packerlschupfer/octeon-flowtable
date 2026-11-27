@@ -13,7 +13,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=octeon-flowtable
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=GPL-2.0
 PKG_MAINTAINER:=octeon-flowtable
 
@@ -53,9 +53,10 @@ endef
 
 # install the procd init script + default UCI config + confsh op-mode plugin
 define KernelPackage/octeon-flowtable/install
-	$(INSTALL_DIR) $(1)/etc/init.d $(1)/etc/config $(1)/usr/libexec/confsh/op/show
+	$(INSTALL_DIR) $(1)/etc/init.d $(1)/etc/config $(1)/etc/uci-defaults $(1)/usr/libexec/confsh/op/show
 	$(INSTALL_BIN) ./files/octeon-flowtable.init $(1)/etc/init.d/octeon-flowtable
 	$(INSTALL_CONF) ./files/octeon-flowtable.config $(1)/etc/config/octeon-flowtable
+	$(INSTALL_DATA) ./files/octeon-flowtable.uci-defaults $(1)/etc/uci-defaults/90-octeon-flowtable-packet-steering
 	$(INSTALL_BIN) ./files/confsh-op-show-offload $(1)/usr/libexec/confsh/op/show/offload
 endef
 
